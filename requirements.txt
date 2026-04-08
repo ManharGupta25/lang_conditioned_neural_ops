@@ -1,0 +1,9 @@
+# Core JAX stack (equinox, optax, pdequinox, trainax, exponax installed as deps)
+jax
+jaxlib
+apebench>=0.1.1
+
+# LLM embedding (Flax backend, offline only — not part of training loop)
+flax
+transformers>=4.47.0      # FlaxLlamaModel and FlaxMistralModel stable from 4.47+
+sentencepiece             # required by LLaMA/Mistral tokenizers
