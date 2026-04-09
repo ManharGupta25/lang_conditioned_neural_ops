@@ -59,7 +59,7 @@ class Config:
     # Primary ablation axis: which method to use for injecting z into the FNO.
     #   "film"            — FiLM: (1 + gamma) * x + beta  per channel
     #   "spectral_gating" — per-frequency gate in Fourier space
-    conditioning_method: str = "film"
+    conditioning_method: str = "spectral_gating"
 
     # Spectral gating MLP hyperparameters (only used when conditioning_method="spectral_gating")
     sg_mlp_width: int = 64    # hidden layer width (default: same as z_cond_dim)
@@ -119,10 +119,12 @@ class Config:
 
     def phase2_label(self) -> str:
         """Label used for Phase 2 checkpoint and CSV filenames.
-        Encodes both the conditioning method and the LLM used.
-        e.g. 'film_distilbert', 'spectral_gating_tinyllama'
+        Encodes conditioning method, LLM, and freeze state.
+        e.g. 'film_distilbert', 'spectral_gating_tinyllama',
+             'film_tinyllama_joint' (when freeze_fno_trunk=False)
         """
-        return f"{self.conditioning_method}_{self.llm_short_name()}"
+        suffix = "_joint" if not self.freeze_fno_trunk else ""
+        return f"{self.conditioning_method}_{self.llm_short_name()}{suffix}"
 
     def fno_network_config(self) -> str:
         """Network config string for the plain baseline FNO."""

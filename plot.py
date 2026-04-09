@@ -28,14 +28,18 @@ RESULTS_DIR = pathlib.Path(_cfg.results_dir)
 FIGURES_DIR = pathlib.Path(_cfg.figures_dir)
 
 _METHOD_PALETTE = {
-    "baseline":         "#4C72B0",
-    "film":             "#DD8452",
-    "spectral_gating":  "#55A868",
+    "baseline":            "#4C72B0",
+    "film":                "#DD8452",
+    "spectral_gating":     "#55A868",
+    "film_joint":          "#C44E52",
+    "spectral_gating_joint": "#8172B2",
 }
 _METHOD_LABELS = {
-    "baseline":         "Baseline FNO",
-    "film":             "FiLM Conditioned",
-    "spectral_gating":  "Spectral Gating",
+    "baseline":            "Baseline FNO",
+    "film":                "FiLM Conditioned",
+    "spectral_gating":     "Spectral Gating",
+    "film_joint":          "FiLM Joint Fine-Tuned",
+    "spectral_gating_joint": "SG Joint Fine-Tuned",
 }
 
 
@@ -43,11 +47,16 @@ def _condition_to_method(condition: str) -> str:
     """Extract conditioning method from a condition label.
     'film_distilbert' -> 'film'
     'spectral_gating_tinyllama' -> 'spectral_gating'
+    'film_tinyllama_joint' -> 'film_joint'
+    'spectral_gating_tinyllama_joint' -> 'spectral_gating_joint'
     'baseline' -> 'baseline'
     """
-    for method in _METHOD_LABELS:
-        if condition == method or condition.startswith(method + "_"):
-            return method
+    is_joint = condition.endswith("_joint")
+    cond = condition.removesuffix("_joint") if is_joint else condition
+    joint_suffix = "_joint" if is_joint else ""
+    for method in ("spectral_gating", "film", "baseline"):
+        if cond == method or cond.startswith(method + "_"):
+            return method + joint_suffix
     return condition
 
 

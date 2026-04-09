@@ -357,9 +357,21 @@ def main():
         "--phase", type=int, choices=[1, 2], required=True,
         help="1 = train baseline FNOs;  2 = warm-start + train conditioned FNOs",
     )
+    parser.add_argument(
+        "--conditioning-method", choices=["film", "spectral_gating"], default=None,
+        help="Override conditioning method (Phase 2 only)",
+    )
+    parser.add_argument(
+        "--freeze-trunk", choices=["true", "false"], default=None,
+        help="Override freeze_fno_trunk: 'true' = frozen, 'false' = joint fine-tuning",
+    )
     args = parser.parse_args()
 
     cfg = Config()
+    if args.conditioning_method is not None:
+        cfg.conditioning_method = args.conditioning_method
+    if args.freeze_trunk is not None:
+        cfg.freeze_fno_trunk = args.freeze_trunk.lower() == "true"
     print("=" * 65)
     print("Language-Conditioned Neural Operators  (APEBench + JAX)")
     print("=" * 65)
