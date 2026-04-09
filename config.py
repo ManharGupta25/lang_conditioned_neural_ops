@@ -103,7 +103,7 @@ class Config:
     # instead of checkpoints_dir. Useful when pointing Phase 2 at a fixed
     # Phase 1 run stored in a different folder.
     # Leave as None to use checkpoints_dir for both reading and writing.
-    phase1_checkpoints_dir: Optional[str] = None
+    phase1_checkpoints_dir: Optional[str] = "checkpoints/fno_12_64_6_gelu_train_20000_1000_50_50_test_100"
 
     # ── Derived APEBench config strings ──────────────────────────────────────
 
