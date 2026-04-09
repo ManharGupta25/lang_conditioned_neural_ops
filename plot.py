@@ -27,45 +27,83 @@ _cfg = Config()
 RESULTS_DIR = pathlib.Path(_cfg.results_dir)
 FIGURES_DIR = pathlib.Path(_cfg.figures_dir)
 
-PALETTE = {
+_METHOD_PALETTE = {
     "baseline":         "#4C72B0",
     "film":             "#DD8452",
     "spectral_gating":  "#55A868",
 }
-LABELS = {
+_METHOD_LABELS = {
     "baseline":         "Baseline FNO",
     "film":             "FiLM Conditioned",
     "spectral_gating":  "Spectral Gating",
 }
 
 
+def _condition_to_method(condition: str) -> str:
+    """Extract conditioning method from a condition label.
+    'film_distilbert' -> 'film'
+    'spectral_gating_tinyllama' -> 'spectral_gating'
+    'baseline' -> 'baseline'
+    """
+    for method in _METHOD_LABELS:
+        if condition == method or condition.startswith(method + "_"):
+            return method
+    return condition
+
+
+def _condition_label(condition: str) -> str:
+    """Human-readable label for a condition string (includes LLM if present)."""
+    method = _condition_to_method(condition)
+    base = _METHOD_LABELS.get(method, condition)
+    # Append LLM name if encoded (e.g. 'film_distilbert' -> 'FiLM Conditioned (distilbert)')
+    parts = condition.split("_", maxsplit=len(method.split("_")))
+    llm_suffix = "_".join(parts[len(method.split("_")):])
+    if llm_suffix:
+        return f"{base} ({llm_suffix})"
+    return base
+
+
+def _condition_color(condition: str) -> str:
+    method = _condition_to_method(condition)
+    return _METHOD_PALETTE.get(method, "#999999")
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_all(cfg: Config, phase: int = 0) -> pd.DataFrame:
+def load_all(cfg: Config, results_dir: pathlib.Path = None) -> pd.DataFrame:
     """
-    Load and concatenate result CSVs.
+    Load and concatenate all result CSVs from results_dir.
+    Picks up baseline + any Phase 2 CSVs present in the directory.
+    """
+    if results_dir is None:
+        results_dir = RESULTS_DIR
 
-    phase=1 : baseline only
-    phase=0 : baseline + all available Phase 2 conditioning method CSVs
-    """
-    phase2_methods = [m for m in LABELS if m != "baseline"]
-    conditions = ["baseline"] if phase == 1 else ["baseline"] + phase2_methods
+    # PDEs that share a prefix with another PDE (e.g. phy_adv vs phy_adv_diff)
+    # need special care so their globs don't bleed into each other.
+    all_pdes = set(cfg.pde_scenarios)
 
     dfs = []
     for pde in cfg.pde_scenarios:
-        for condition in conditions:
-            path = RESULTS_DIR / f"{pde}_{condition}.csv"
-            if path.exists():
-                df = pd.read_csv(path)
-                df["condition"] = condition
-                df["pde"] = pde
-                dfs.append(df)
-            else:
-                if condition == "baseline":
-                    print(f"  [warn] missing {path} — skipping")
+        # Other PDEs whose name starts with this pde — their files would be
+        # incorrectly matched by the glob f"{pde}_*.csv".
+        longer_pdes = {p for p in all_pdes if p != pde and p.startswith(pde + "_")}
+
+        for csv_path in sorted(results_dir.glob(f"{pde}_*.csv")):
+            # Skip files that actually belong to a longer-named PDE
+            if any(csv_path.stem.startswith(p + "_") for p in longer_pdes):
+                continue
+            label = csv_path.stem[len(pde) + 1:]   # strip "<pde>_"
+            df = pd.read_csv(csv_path)
+            df["condition"] = label
+            df["pde"] = pde
+            dfs.append(df)
+
+        if not (results_dir / f"{pde}_baseline.csv").exists():
+            print(f"  [warn] no baseline CSV for {pde} in {results_dir}")
+
     if not dfs:
         raise FileNotFoundError(
-            "No result CSVs found in results/. Run train.py --phase 1 (and 2) first."
+            f"No result CSVs found in {results_dir}. Run train.py --phase 1 (and 2) first."
         )
     return pd.concat(dfs, ignore_index=True)
 
@@ -129,15 +167,16 @@ def _make_fig(n_pdes: int, height: float = 4.0):
 
 # ── Figure 1 — nRMSE rollout ──────────────────────────────────────────────────
 
-def plot_nrmse_rollout(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path):
+def plot_nrmse_rollout(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path, suffix: str = ""):
     """
     One subplot per PDE.
     x: test timestep   y: mean nRMSE
     Two lines (baseline / conditioned) with 95% CI shading across seeds.
     """
     df = melt_nrmse(data)
-    df["Condition"] = df["condition"].map(lambda c: LABELS.get(c, c))
-    palette = {LABELS.get(k, k): v for k, v in PALETTE.items()}
+    df["Condition"] = df["condition"].map(_condition_label)
+    conditions = df["condition"].unique()
+    palette = {_condition_label(c): _condition_color(c) for c in conditions}
 
     fig, axes = _make_fig(len(cfg.pde_scenarios))
 
@@ -162,7 +201,7 @@ def plot_nrmse_rollout(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path):
         fontsize=13, y=1.02,
     )
     fig.tight_layout()
-    out = save_dir / "nrmse_rollout.png"
+    out = save_dir / f"nrmse_rollout{suffix}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out}")
@@ -170,7 +209,7 @@ def plot_nrmse_rollout(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path):
 
 # ── Figure 2 — Training loss ──────────────────────────────────────────────────
 
-def plot_train_loss(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path):
+def plot_train_loss(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path, suffix: str = ""):
     """
     One subplot per PDE.
     x: training step   y: MSE loss (log scale)
@@ -181,8 +220,9 @@ def plot_train_loss(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path):
         print("  [warn] No loss columns found — skipping train_loss.png")
         return
 
-    df["Condition"] = df["condition"].map(lambda c: LABELS.get(c, c))
-    palette = {LABELS.get(k, k): v for k, v in PALETTE.items()}
+    df["Condition"] = df["condition"].map(_condition_label)
+    conditions = df["condition"].unique()
+    palette = {_condition_label(c): _condition_color(c) for c in conditions}
 
     fig, axes = _make_fig(len(cfg.pde_scenarios))
 
@@ -208,7 +248,7 @@ def plot_train_loss(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path):
         fontsize=13, y=1.02,
     )
     fig.tight_layout()
-    out = save_dir / "train_loss.png"
+    out = save_dir / f"train_loss{suffix}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out}")
@@ -216,7 +256,7 @@ def plot_train_loss(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path):
 
 # ── Figure 3 — Final nRMSE bar chart ─────────────────────────────────────────
 
-def plot_final_nrmse_bar(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path):
+def plot_final_nrmse_bar(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path, suffix: str = ""):
     """
     Grouped bar chart: PDE × condition at the final test timestep.
     Error bars = std across seeds.
@@ -224,9 +264,10 @@ def plot_final_nrmse_bar(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path
     df = melt_nrmse(data)
     final_t = df["time_step"].max()
     df = df[df["time_step"] == final_t].copy()
-    df["Condition"] = df["condition"].map(lambda c: LABELS.get(c, c))
+    df["Condition"] = df["condition"].map(_condition_label)
     df["PDE"] = df["pde"].map(_pde_title)
-    palette = {LABELS.get(k, k): v for k, v in PALETTE.items()}
+    conditions = df["condition"].unique()
+    palette = {_condition_label(c): _condition_color(c) for c in conditions}
 
     fig, ax = plt.subplots(figsize=(max(5, len(cfg.pde_scenarios) * 2.5), 4))
     sns.barplot(
@@ -249,7 +290,7 @@ def plot_final_nrmse_bar(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path
     _apply_grid(ax)
 
     fig.tight_layout()
-    out = save_dir / "final_nrmse_bar.png"
+    out = save_dir / f"final_nrmse_bar{suffix}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out}")
@@ -260,25 +301,36 @@ def plot_final_nrmse_bar(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path
 def main():
     parser = argparse.ArgumentParser(description="Plot training results")
     parser.add_argument(
-        "--phase", type=int, choices=[1], default=0,
-        help="1 = plot Phase 1 baseline only; omit to include all available results",
+        "--results-dir", default=None,
+        help="Override results directory (default: cfg.results_dir from config.py)",
+    )
+    parser.add_argument(
+        "--figures-dir", default=None,
+        help="Override figures output directory (default: cfg.figures_dir from config.py)",
+    )
+    parser.add_argument(
+        "--suffix", default="",
+        help="Suffix appended to output filenames, e.g. 'baseline' -> nrmse_rollout_baseline.png",
     )
     args = parser.parse_args()
 
     cfg = Config()
-    FIGURES_DIR.mkdir(exist_ok=True)
+    results_dir = pathlib.Path(args.results_dir) if args.results_dir else pathlib.Path(cfg.results_dir)
+    figures_dir = pathlib.Path(args.figures_dir) if args.figures_dir else pathlib.Path(cfg.figures_dir)
+    suffix = f"_{args.suffix}" if args.suffix else ""
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading results ...")
-    data = load_all(cfg, phase=args.phase)
+    data = load_all(cfg, results_dir=results_dir)
     conditions = sorted(data["condition"].unique()) if "condition" in data.columns else []
     print(f"  PDEs: {data['pde'].nunique()}  "
           f"Seeds: {data['seed'].nunique()}  "
           f"Conditions: {conditions}")
 
-    print("\nGenerating figures -> figures/")
-    plot_nrmse_rollout(data, cfg, FIGURES_DIR)
-    plot_train_loss(data, cfg, FIGURES_DIR)
-    plot_final_nrmse_bar(data, cfg, FIGURES_DIR)
+    print(f"\nGenerating figures -> {figures_dir}/")
+    plot_nrmse_rollout(data, cfg, figures_dir, suffix)
+    plot_train_loss(data, cfg, figures_dir, suffix)
+    plot_final_nrmse_bar(data, cfg, figures_dir, suffix)
     print("\nDone.")
 
 

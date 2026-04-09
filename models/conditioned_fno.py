@@ -114,14 +114,16 @@ class SpectralGating(eqx.Module):
         self,
         cond_dim: int,
         num_modes: int,
+        mlp_width: int = 64,
+        mlp_depth: int = 2,
         *,
         key: PRNGKeyArray,
     ):
         self.gate_mlp = eqx.nn.MLP(
             in_size=cond_dim,
             out_size=num_modes,
-            width_size=cond_dim,
-            depth=2,
+            width_size=mlp_width,
+            depth=mlp_depth,
             key=key,
         )
         self.num_modes = num_modes
@@ -168,6 +170,10 @@ class ConditionedFNO(eqx.Module):
     # Selects which conditioning path is active (static string, not a JAX array)
     conditioning_method: str
 
+    # If True, stop_gradient is applied to all FNO trunk outputs so gradients
+    # only flow through z_proj and the conditioning layers.
+    freeze_trunk: bool
+
     # Frozen language embedding (stop_gradient enforced in __call__)
     z: Array                     # shape (z_embed_dim,)
 
@@ -182,6 +188,9 @@ class ConditionedFNO(eqx.Module):
         z_embed: Array,           # precomputed LLM embedding, shape (z_embed_dim,)
         cond_dim: int,            # projection target dim
         conditioning_method: str = "film",
+        sg_mlp_width: int = 64,
+        sg_mlp_depth: int = 2,
+        freeze_trunk: bool = True,
         *,
         key: PRNGKeyArray,
     ):
@@ -225,12 +234,15 @@ class ConditionedFNO(eqx.Module):
             SpectralGating(
                 cond_dim=cond_dim,
                 num_modes=num_modes,
+                mlp_width=sg_mlp_width,
+                mlp_depth=sg_mlp_depth,
                 key=sg_keys[i],
             )
             for i in range(num_blocks)
         ]
 
         self.conditioning_method = conditioning_method
+        self.freeze_trunk = freeze_trunk
 
         # Store embedding as JAX array; frozen via stop_gradient in forward
         self.z = jnp.array(z_embed)
@@ -241,19 +253,33 @@ class ConditionedFNO(eqx.Module):
         z_cond = self.z_proj(z)                 # (cond_dim,)   [trained]
 
         # ── FNO forward with conditioning after each block ────────────────────
-        x = self.fno_lifting(u_t)
+        # If freeze_trunk, stop_gradient is applied to trunk weights so they
+        # are treated as constants during backprop. Gradients still flow back
+        # through the trunk's linear transformation to reach all conditioning
+        # layers. Only array leaves are stop_gradiented — non-array fields
+        # (ints, bools) are left unchanged to avoid errors.
+        def _trunk(fn, x):
+            if self.freeze_trunk:
+                frozen_fn = jax.tree_util.tree_map(
+                    lambda leaf: jax.lax.stop_gradient(leaf) if eqx.is_array(leaf) else leaf,
+                    fn,
+                )
+                return frozen_fn(x)
+            return fn(x)
+
+        x = _trunk(self.fno_lifting, u_t)
 
         if self.conditioning_method == "film":
             for block, film in zip(self.fno_blocks, self.film_layers):
-                x = block(x)
+                x = _trunk(block, x)
                 x = film(x, z_cond)
 
         elif self.conditioning_method == "spectral_gating":
             for block, sg in zip(self.fno_blocks, self.spectral_gating_layers):
-                x = block(x)
+                x = _trunk(block, x)
                 x = sg(x, z_cond)
 
-        x = self.fno_projection(x)
+        x = _trunk(self.fno_projection, x)
         return x
 
 

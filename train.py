@@ -12,8 +12,10 @@ After both phases:
     python plot.py                   Generate comparison figures
 
 Phase 1 must complete before Phase 2.
-Checkpoints : checkpoints/<scenario_key>_{baseline,conditioned}.eqx
-Result CSVs : results/<scenario_key>_{baseline,conditioned}.csv
+Checkpoints : checkpoints/<run>/<scenario_key>_baseline.eqx          (Phase 1)
+             checkpoints/<run>/<scenario_key>_<method>_<llm>.eqx    (Phase 2)
+Result CSVs : results/<run>/<scenario_key>_baseline.csv             (Phase 1)
+             results/<run>/<scenario_key>_<method>_<llm>.csv        (Phase 2)
 
 Multi-seed:
     APEBench vmaps over seeds for Phase 1 (plain scenario()).
@@ -41,7 +43,7 @@ from models.conditioned_fno import ConditionedFNO
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_scenario(scenario_key: str, cfg: Config):
+def _make_scenario(scenario_key: str, cfg: Config, optim_config: str = None):
     return scenario_dict[scenario_key](
         num_spatial_dims=cfg.num_spatial_dims,
         num_points=cfg.num_points,
@@ -50,7 +52,7 @@ def _make_scenario(scenario_key: str, cfg: Config):
         train_temporal_horizon=cfg.train_temporal_horizon,
         test_temporal_horizon=cfg.test_temporal_horizon,
         batch_size=cfg.batch_size,
-        optim_config=cfg.optim_config(),
+        optim_config=optim_config or cfg.optim_config(),
     )
 
 
@@ -82,8 +84,10 @@ def _load_baseline_batch(scenario_key: str, cfg: Config) -> eqx.Module:
     """
     Load the Phase 1 multi-seed checkpoint.
     Re-creates the batched model structure then deserialises weights.
+    Reads from cfg.phase1_checkpoints_dir if set, otherwise cfg.checkpoints_dir.
     """
-    ckpt = _ckpt(scenario_key, "baseline", cfg)
+    ckpt_dir = pathlib.Path(cfg.phase1_checkpoints_dir) if cfg.phase1_checkpoints_dir else pathlib.Path(cfg.checkpoints_dir)
+    ckpt = ckpt_dir / f"{scenario_key}_baseline.eqx"
     if not ckpt.exists():
         raise FileNotFoundError(
             f"No Phase 1 checkpoint at {ckpt}.\n"
@@ -121,7 +125,7 @@ def _build_warmstarted_batch(
 
     for i in range(cfg.num_seeds):
         # Extract seed i's Phase 1 model (drop the batch axis)
-        p1_i = jax.tree_map(lambda x: x[i], phase1_batch)
+        p1_i = jax.tree.map(lambda x: x[i] if eqx.is_array(x) else x, phase1_batch)
 
         # Build ConditionedFNO with random conditioning weights
         c_i = ConditionedFNO(
@@ -134,6 +138,9 @@ def _build_warmstarted_batch(
             z_embed=z,
             cond_dim=cfg.z_cond_dim,
             conditioning_method=cfg.conditioning_method,
+            sg_mlp_width=cfg.sg_mlp_width,
+            sg_mlp_depth=cfg.sg_mlp_depth,
+            freeze_trunk=cfg.freeze_fno_trunk,
             key=jax.random.PRNGKey(i),
         )
 
@@ -146,7 +153,7 @@ def _build_warmstarted_batch(
         cond_fno_list.append(c_i)
 
     # Stack leaf arrays along a new leading seed axis
-    return jax.tree_map(lambda *xs: jnp.stack(xs, axis=0), *cond_fno_list)
+    return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0) if eqx.is_array(xs[0]) else xs[0], *cond_fno_list)
 
 
 def _build_result_df(
@@ -200,7 +207,7 @@ def run_phase1(cfg: Config):
     """
     results_dir = pathlib.Path(cfg.results_dir)
     pathlib.Path(cfg.checkpoints_dir).mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 65)
     print(f"PHASE 1  —  Baseline FNO  ({cfg.num_seeds} seeds per PDE)")
@@ -252,11 +259,13 @@ def run_phase2(cfg: Config):
     """
     results_dir = pathlib.Path(cfg.results_dir)
     pathlib.Path(cfg.checkpoints_dir).mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 65)
     print(f"PHASE 2  —  Conditioned FNO  ({cfg.num_seeds} seeds per PDE)")
-    print(f"LLM: {cfg.llm_model_name}")
+    print(f"LLM       : {cfg.llm_model_name}")
+    print(f"Trunk     : {'frozen' if cfg.freeze_fno_trunk else 'jointly fine-tuned'}")
+    print(f"Steps     : {cfg.phase2_train_steps}")
     print("=" * 65)
 
     print("\nPrecomputing language embeddings ...")
@@ -269,7 +278,7 @@ def run_phase2(cfg: Config):
     summary = {}
     for scenario_key in cfg.pde_scenarios:
         print(f"  Training: {scenario_key}")
-        scenario = _make_scenario(scenario_key, cfg)
+        scenario = _make_scenario(scenario_key, cfg, optim_config=cfg.phase2_optim_config())
 
         # ── Step 1: load Phase 1 weights ──────────────────────────────────────
         phase1_batch = _load_baseline_batch(scenario_key, cfg)
@@ -290,11 +299,12 @@ def run_phase2(cfg: Config):
                 shuffle_key,
                 return_loss_history=True,
                 record_loss_every=scenario.record_loss_every,
-                spawn_tqdm=False,   # tqdm doesn't work inside vmap
+                spawn_tqdm=False,
             )
             return trained, loss_history
 
-        print(f"  Running vmapped training ...")
+        trunk_status = "frozen" if cfg.freeze_fno_trunk else "jointly fine-tuned"
+        print(f"  Running vmapped training (FNO trunk {trunk_status}) ...")
         trained_batch, loss_batch = eqx.filter_vmap(train_one)(
             cond_fno_batch, shuffle_keys
         )
@@ -303,7 +313,7 @@ def run_phase2(cfg: Config):
         metric_trj_s = scenario.perform_tests(trained_batch)
 
         # ── Step 5: build DataFrame, save ─────────────────────────────────────
-        label = cfg.conditioning_method   # e.g. "film" or "spectral_gating"
+        label = cfg.phase2_label()   # e.g. "film_distilbert" or "spectral_gating_tinyllama"
         data = _build_result_df(
             metric_trj_s, loss_batch,
             scenario_key, cfg.cfno_network_config(), cfg,
