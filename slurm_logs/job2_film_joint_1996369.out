@@ -1,0 +1,62 @@
+=== JAX devices ===
+Backend: gpu
+Devices: [CudaDevice(id=0)]
+===================
+=================================================================
+Language-Conditioned Neural Operators  (APEBench + JAX)
+=================================================================
+PDEs        : ['phy_adv_diff', 'phy_ks', 'phy_burgers']
+Seeds       : 3
+FNO         : modes=12  hidden=64  blocks=6
+Train steps : 20000  |  batch=50
+
+=================================================================
+PHASE 2  —  Conditioned FNO  (3 seeds per PDE)
+LLM       : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+Trunk     : jointly fine-tuned
+Steps     : 20000
+=================================================================
+
+Precomputing language embeddings ...
+  Model  : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  Arch   : decoder  |  Backend : flax  |  Hidden dim : 2048
+  z[phy_adv_diff]  shape=(2048,)  norm=1.0000
+  z[phy_ks]  shape=(2048,)  norm=1.0000
+  z[phy_burgers]  shape=(2048,)  norm=1.0000
+z_embed_dim = 2048
+
+  Training: phy_adv_diff
+  Phase 1 checkpoint loaded (3 seeds).
+  FNO trunk warm-started; conditioning=film.
+  Running vmapped training (FNO trunk jointly fine-tuned) ...
+  Checkpoint -> checkpoints/fno_12_64_6_gelu_train_20000_1000_50_50_test_100/phy_adv_diff_film_tinyllama-1.1b-chat-_joint.eqx
+  CSV saved  -> results/fno_12_64_6_gelu_train_20000_1000_50_50_test_100/phy_adv_diff_film_tinyllama-1.1b-chat-_joint.csv
+  Final nRMSE: 0.7732
+
+  Training: phy_ks
+  Phase 1 checkpoint loaded (3 seeds).
+  FNO trunk warm-started; conditioning=film.
+  Running vmapped training (FNO trunk jointly fine-tuned) ...
+  Checkpoint -> checkpoints/fno_12_64_6_gelu_train_20000_1000_50_50_test_100/phy_ks_film_tinyllama-1.1b-chat-_joint.eqx
+  CSV saved  -> results/fno_12_64_6_gelu_train_20000_1000_50_50_test_100/phy_ks_film_tinyllama-1.1b-chat-_joint.csv
+  Final nRMSE: 0.3510
+
+  Training: phy_burgers
+  Phase 1 checkpoint loaded (3 seeds).
+  FNO trunk warm-started; conditioning=film.
+  Running vmapped training (FNO trunk jointly fine-tuned) ...
+  Checkpoint -> checkpoints/fno_12_64_6_gelu_train_20000_1000_50_50_test_100/phy_burgers_film_tinyllama-1.1b-chat-_joint.eqx
+  CSV saved  -> results/fno_12_64_6_gelu_train_20000_1000_50_50_test_100/phy_burgers_film_tinyllama-1.1b-chat-_joint.csv
+  Final nRMSE: 0.0649
+
+=================================================================
+PHASE 2 SUMMARY  vs Phase 1 baseline
+=================================================================
+PDE                       Baseline   Conditioned     Delta
+----------------------------------------------------------
+phy_adv_diff                0.1423        0.7732  + 0.6309
+phy_ks                      0.3621        0.3510  -0.0110
+phy_burgers                 0.0667        0.0649  -0.0018
+Conditioning method: film
+
+Run  python plot.py  to generate comparison figures.

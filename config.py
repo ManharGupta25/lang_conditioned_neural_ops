@@ -73,7 +73,7 @@ class Config:
 
     # ── Training (Phase 2) ────────────────────────────────────────────────────
     # Steps when FNO trunk is frozen — only conditioning layers train.
-    phase2_train_steps: int = 10000
+    phase2_train_steps: int = 20000
 
     # Steps for joint fine-tuning (freeze_fno_trunk=False). Fewer than
     # phase2_train_steps to reduce risk of trunk drifting from Phase 1 solution.

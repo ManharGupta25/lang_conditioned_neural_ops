@@ -365,6 +365,10 @@ def main():
         "--freeze-trunk", choices=["true", "false"], default=None,
         help="Override freeze_fno_trunk: 'true' = frozen, 'false' = joint fine-tuning",
     )
+    parser.add_argument(
+        "--scenarios", nargs="+", default=None,
+        help="Run only these PDE scenarios (e.g. --scenarios phy_adv phy_ks)",
+    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -372,6 +376,8 @@ def main():
         cfg.conditioning_method = args.conditioning_method
     if args.freeze_trunk is not None:
         cfg.freeze_fno_trunk = args.freeze_trunk.lower() == "true"
+    if args.scenarios is not None:
+        cfg.pde_scenarios = args.scenarios
     print("=" * 65)
     print("Language-Conditioned Neural Operators  (APEBench + JAX)")
     print("=" * 65)

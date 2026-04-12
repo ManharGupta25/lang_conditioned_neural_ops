@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "/home/sgoudarzi/miniconda/lib/python3.13/site-packages/jax/_src/xla_bridge.py", line 812, in backends
+    backend = _init_backend(platform)
+  File "/home/sgoudarzi/miniconda/lib/python3.13/site-packages/jax/_src/xla_bridge.py", line 888, in _init_backend
+    raise RuntimeError(
+        f"Backend '{platform}' is not in the list of known backends: "
+        f"{list(_backend_factories.keys())}.")
+RuntimeError: Backend 'cuda' is not in the list of known backends: ['cpu', 'tpu'].
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import jax; print('Devices:', jax.devices()); print('Backend:', jax.default_backend())
+                                  ~~~~~~~~~~~^^
+  File "/home/sgoudarzi/miniconda/lib/python3.13/site-packages/jax/_src/xla_bridge.py", line 1010, in devices
+    return get_backend(backend).devices()
+           ~~~~~~~~~~~^^^^^^^^^
+  File "/home/sgoudarzi/miniconda/lib/python3.13/site-packages/jax/_src/xla_bridge.py", line 944, in get_backend
+    return _get_backend_uncached(platform)
+  File "/home/sgoudarzi/miniconda/lib/python3.13/site-packages/jax/_src/xla_bridge.py", line 923, in _get_backend_uncached
+    bs = backends()
+  File "/home/sgoudarzi/miniconda/lib/python3.13/site-packages/jax/_src/xla_bridge.py", line 828, in backends
+    raise RuntimeError(err_msg)
+RuntimeError: Unable to initialize backend 'cuda': Backend 'cuda' is not in the list of known backends: ['cpu', 'tpu']. (set JAX_PLATFORMS='' to automatically choose an available backend)

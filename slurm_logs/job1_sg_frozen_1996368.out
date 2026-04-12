@@ -1,0 +1,42 @@
+=== JAX devices ===
+Backend: gpu
+Devices: [CudaDevice(id=0)]
+===================
+=================================================================
+Language-Conditioned Neural Operators  (APEBench + JAX)
+=================================================================
+PDEs        : ['phy_burgers']
+Seeds       : 3
+FNO         : modes=12  hidden=64  blocks=6
+Train steps : 20000  |  batch=50
+
+=================================================================
+PHASE 2  —  Conditioned FNO  (3 seeds per PDE)
+LLM       : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+Trunk     : frozen
+Steps     : 20000
+=================================================================
+
+Precomputing language embeddings ...
+  Model  : TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  Arch   : decoder  |  Backend : flax  |  Hidden dim : 2048
+  z[phy_burgers]  shape=(2048,)  norm=1.0000
+z_embed_dim = 2048
+
+  Training: phy_burgers
+  Phase 1 checkpoint loaded (3 seeds).
+  FNO trunk warm-started; conditioning=spectral_gating.
+  Running vmapped training (FNO trunk frozen) ...
+  Checkpoint -> checkpoints/fno_12_64_6_gelu_train_20000_1000_50_50_test_100/phy_burgers_spectral_gating_tinyllama-1.1b-chat-.eqx
+  CSV saved  -> results/fno_12_64_6_gelu_train_20000_1000_50_50_test_100/phy_burgers_spectral_gating_tinyllama-1.1b-chat-.csv
+  Final nRMSE: 0.0664
+
+=================================================================
+PHASE 2 SUMMARY  vs Phase 1 baseline
+=================================================================
+PDE                       Baseline   Conditioned     Delta
+----------------------------------------------------------
+phy_burgers                 0.0667        0.0664  -0.0003
+Conditioning method: spectral_gating
+
+Run  python plot.py  to generate comparison figures.
