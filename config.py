@@ -66,7 +66,7 @@ class Config:
     sg_mlp_depth: int = 2     # number of hidden layers
 
     # ── Training (Phase 1) ────────────────────────────────────────────────────
-    num_train_steps: int = 20000
+    num_train_steps: int = 30000
     num_train_samples: int = 1000
     batch_size: int = 50
     train_temporal_horizon: int = 50
