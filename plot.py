@@ -28,14 +28,18 @@ RESULTS_DIR = pathlib.Path(_cfg.results_dir)
 FIGURES_DIR = pathlib.Path(_cfg.figures_dir)
 
 _METHOD_PALETTE = {
-    "baseline":         "#4C72B0",
-    "film":             "#DD8452",
-    "spectral_gating":  "#55A868",
+    "baseline":            "#4C72B0",
+    "film":                "#DD8452",
+    "spectral_gating":     "#55A868",
+    "film_joint":          "#C44E52",
+    "spectral_gating_joint": "#8172B2",
 }
 _METHOD_LABELS = {
-    "baseline":         "Baseline FNO",
-    "film":             "FiLM Conditioned",
-    "spectral_gating":  "Spectral Gating",
+    "baseline":            "Baseline FNO",
+    "film":                "FiLM Conditioned",
+    "spectral_gating":     "Spectral Gating",
+    "film_joint":          "FiLM Joint Fine-Tuned",
+    "spectral_gating_joint": "SG Joint Fine-Tuned",
 }
 
 
@@ -43,11 +47,16 @@ def _condition_to_method(condition: str) -> str:
     """Extract conditioning method from a condition label.
     'film_distilbert' -> 'film'
     'spectral_gating_tinyllama' -> 'spectral_gating'
+    'film_tinyllama_joint' -> 'film_joint'
+    'spectral_gating_tinyllama_joint' -> 'spectral_gating_joint'
     'baseline' -> 'baseline'
     """
-    for method in _METHOD_LABELS:
-        if condition == method or condition.startswith(method + "_"):
-            return method
+    is_joint = condition.endswith("_joint")
+    cond = condition.removesuffix("_joint") if is_joint else condition
+    joint_suffix = "_joint" if is_joint else ""
+    for method in ("spectral_gating", "film", "baseline"):
+        if cond == method or cond.startswith(method + "_"):
+            return method + joint_suffix
     return condition
 
 
@@ -70,13 +79,16 @@ def _condition_color(condition: str) -> str:
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_all(cfg: Config, results_dir: pathlib.Path = None) -> pd.DataFrame:
+def load_all(cfg: Config, results_dir: pathlib.Path = None, baseline_dir: pathlib.Path = None) -> pd.DataFrame:
     """
-    Load and concatenate all result CSVs from results_dir.
-    Picks up baseline + any Phase 2 CSVs present in the directory.
+    Load and concatenate all result CSVs.
+    - Baseline CSVs loaded from baseline_dir (falls back to cfg.phase1_results_dir, then results_dir)
+    - Phase 2 CSVs loaded from results_dir
     """
     if results_dir is None:
         results_dir = RESULTS_DIR
+    if baseline_dir is None:
+        baseline_dir = pathlib.Path(cfg.phase1_results_dir) if cfg.phase1_results_dir else results_dir
 
     # PDEs that share a prefix with another PDE (e.g. phy_adv vs phy_adv_diff)
     # need special care so their globs don't bleed into each other.
@@ -84,22 +96,29 @@ def load_all(cfg: Config, results_dir: pathlib.Path = None) -> pd.DataFrame:
 
     dfs = []
     for pde in cfg.pde_scenarios:
-        # Other PDEs whose name starts with this pde — their files would be
-        # incorrectly matched by the glob f"{pde}_*.csv".
         longer_pdes = {p for p in all_pdes if p != pde and p.startswith(pde + "_")}
 
+        # Load baseline from baseline_dir
+        baseline_csv = baseline_dir / f"{pde}_baseline.csv"
+        if baseline_csv.exists():
+            df = pd.read_csv(baseline_csv)
+            df["condition"] = "baseline"
+            df["pde"] = pde
+            dfs.append(df)
+        else:
+            print(f"  [warn] no baseline CSV for {pde} in {baseline_dir}")
+
+        # Load Phase 2 CSVs from results_dir (skip baseline)
         for csv_path in sorted(results_dir.glob(f"{pde}_*.csv")):
-            # Skip files that actually belong to a longer-named PDE
             if any(csv_path.stem.startswith(p + "_") for p in longer_pdes):
                 continue
-            label = csv_path.stem[len(pde) + 1:]   # strip "<pde>_"
+            label = csv_path.stem[len(pde) + 1:]
+            if label == "baseline":
+                continue   # already loaded from baseline_dir
             df = pd.read_csv(csv_path)
             df["condition"] = label
             df["pde"] = pde
             dfs.append(df)
-
-        if not (results_dir / f"{pde}_baseline.csv").exists():
-            print(f"  [warn] no baseline CSV for {pde} in {results_dir}")
 
     if not dfs:
         raise FileNotFoundError(
@@ -316,12 +335,13 @@ def main():
 
     cfg = Config()
     results_dir = pathlib.Path(args.results_dir) if args.results_dir else pathlib.Path(cfg.results_dir)
+    baseline_dir = pathlib.Path(cfg.phase1_results_dir) if cfg.phase1_results_dir else results_dir
     figures_dir = pathlib.Path(args.figures_dir) if args.figures_dir else pathlib.Path(cfg.figures_dir)
     suffix = f"_{args.suffix}" if args.suffix else ""
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading results ...")
-    data = load_all(cfg, results_dir=results_dir)
+    data = load_all(cfg, results_dir=results_dir, baseline_dir=baseline_dir)
     conditions = sorted(data["condition"].unique()) if "condition" in data.columns else []
     print(f"  PDEs: {data['pde'].nunique()}  "
           f"Seeds: {data['seed'].nunique()}  "

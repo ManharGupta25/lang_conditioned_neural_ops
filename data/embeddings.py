@@ -263,26 +263,47 @@ def _embed_torch(text: str, tokenizer, model, arch: str) -> np.ndarray:
 def precompute_embeddings(
     scenario_keys: List[str],
     model_name: str,
+    embeddings_dir: str = None,
 ) -> Tuple[Dict[str, np.ndarray], int]:
     """
     Precompute language embeddings for all requested PDE scenarios.
 
-    Loads `model_name` once (Flax if supported, PyTorch otherwise).
-    Runs one forward pass per PDE description.
+    If embeddings_dir is set and all .npy files + embed_dim.txt exist there,
+    loads from disk instead of running the LLM — useful when PyTorch and JAX
+    conflict over CUDA versions. Otherwise computes inline as normal.
 
     Returns:
         embeddings : Dict[scenario_key -> z]
                      z is float32 numpy, shape (hidden_dim,), unit-normalized
-        embed_dim  : int — the model's hidden dimension (set this as Config.z_embed_dim)
+        embed_dim  : int — the model's hidden dimension
     """
+    import pathlib
+
+    # ── Try loading from disk first ───────────────────────────────────────────
+    if embeddings_dir is not None:
+        cache_dir = pathlib.Path(embeddings_dir)
+        dim_file = cache_dir / "embed_dim.txt"
+        all_exist = dim_file.exists() and all(
+            (cache_dir / f"{key}.npy").exists() for key in scenario_keys
+        )
+        if all_exist:
+            print(f"  Loading precomputed embeddings from {cache_dir}/")
+            embed_dim = int(dim_file.read_text().strip())
+            embeddings: Dict[str, np.ndarray] = {}
+            for key in scenario_keys:
+                z = np.load(cache_dir / f"{key}.npy")
+                embeddings[key] = z
+                print(f"  z[{key}]  shape={z.shape}  norm={np.linalg.norm(z):.4f}")
+            return embeddings, embed_dim
+
+    # ── Compute inline ────────────────────────────────────────────────────────
     tokenizer, model, arch, hidden_dim, backend = _load_model(model_name)
     embed_fn = _embed_flax if backend == "flax" else _embed_torch
 
-    embeddings: Dict[str, np.ndarray] = {}
+    embeddings = {}
     for key in scenario_keys:
         text = PDE_DESCRIPTIONS.get(key, key)
         z = embed_fn(text, tokenizer, model, arch)
-        # Unit-normalize for numerical stability
         z = z / (np.linalg.norm(z) + 1e-8)
         embeddings[key] = z
         print(f"  z[{key}]  shape={z.shape}  norm={np.linalg.norm(z):.4f}")

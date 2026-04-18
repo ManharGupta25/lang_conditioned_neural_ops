@@ -38,7 +38,7 @@ class Config:
     #   "meta-llama/Llama-2-7b-hf"        4096-dim decoder  7B params
     #   "mistralai/Mistral-7B-v0.1"       4096-dim decoder  7B params
     #
-    llm_model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    llm_model_name: str = "meta-llama/Llama-2-7b-hf"
 
     # z_embed_dim is set automatically from the loaded model; do not set manually.
     # It is written here as a placeholder that gets filled in train.py after loading.
@@ -73,11 +73,11 @@ class Config:
 
     # ── Training (Phase 2) ────────────────────────────────────────────────────
     # Steps when FNO trunk is frozen — only conditioning layers train.
-    phase2_train_steps: int = 10000
+    phase2_train_steps: int = 20000
 
     # Steps for joint fine-tuning (freeze_fno_trunk=False). Fewer than
     # phase2_train_steps to reduce risk of trunk drifting from Phase 1 solution.
-    phase2_joint_train_steps: int = 2000
+    phase2_joint_train_steps: int = 10000
 
     # If True, FNO trunk (lifting, blocks, projection) is frozen — only z_proj
     # and conditioning layers are trained. Clean ablation: measures what language
@@ -92,18 +92,23 @@ class Config:
 
     # ── Seeds ─────────────────────────────────────────────────────────────────
     # APEBench vmaps over seeds automatically — gives mean ± CI for free.
-    num_seeds: int = 3
+    num_seeds: int = 5
 
     # ── Output ────────────────────────────────────────────────────────────────
-    results_dir: str = "results/fno_12_64_6_gelu_train_20000_1000_50_50_test_100"       # CSVs saved here for plotting
-    figures_dir: str = "figures/fno_12_64_6_gelu_train_20000_1000_50_50_test_100"       # figures saved here by plot.py
-    checkpoints_dir: str = "checkpoints/fno_12_64_6_gelu_train_20000_1000_50_50_test_100"  # model checkpoints
+    results_dir: str = "results/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"       # CSVs saved here for plotting
+    figures_dir: str = "figures/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"       # figures saved here by plot.py
+    checkpoints_dir: str = "checkpoints/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"  # model checkpoints
+    embeddings_dir: str = "embeddings"   # precomputed LLM embeddings (optional, for CUDA conflict workaround)
 
     # If set, Phase 2 loads Phase 1 baseline checkpoints from this directory
     # instead of checkpoints_dir. Useful when pointing Phase 2 at a fixed
     # Phase 1 run stored in a different folder.
     # Leave as None to use checkpoints_dir for both reading and writing.
-    phase1_checkpoints_dir: Optional[str] = "checkpoints/fno_12_64_6_gelu_train_20000_1000_50_50_test_100"
+    phase1_checkpoints_dir: Optional[str] = "checkpoints/fno_12_64_6_gelu_train_30000_1000_50_50_test_100"
+
+    # If set, Phase 2 reads Phase 1 baseline CSVs from this directory for the
+    # summary table comparison. Leave as None to use results_dir.
+    phase1_results_dir: Optional[str] = "results/fno_12_64_6_gelu_train_30000_1000_50_50_test_100"
 
     # ── Derived APEBench config strings ──────────────────────────────────────
 
@@ -119,10 +124,12 @@ class Config:
 
     def phase2_label(self) -> str:
         """Label used for Phase 2 checkpoint and CSV filenames.
-        Encodes both the conditioning method and the LLM used.
-        e.g. 'film_distilbert', 'spectral_gating_tinyllama'
+        Encodes conditioning method, LLM, and freeze state.
+        e.g. 'film_distilbert', 'spectral_gating_tinyllama',
+             'film_tinyllama_joint' (when freeze_fno_trunk=False)
         """
-        return f"{self.conditioning_method}_{self.llm_short_name()}"
+        suffix = "_joint" if not self.freeze_fno_trunk else ""
+        return f"{self.conditioning_method}_{self.llm_short_name()}{suffix}"
 
     def fno_network_config(self) -> str:
         """Network config string for the plain baseline FNO."""
