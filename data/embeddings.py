@@ -394,33 +394,58 @@ def precompute_embeddings(
     scenario_keys: List[str],
     model_name: str,
     cfg=None,
+    embeddings_dir: str = None,
 ) -> Tuple[Dict[str, np.ndarray], int]:
     """
     Precompute language embeddings for all requested PDE scenarios.
 
-    Loads `model_name` once (Flax if supported, PyTorch otherwise).
-    Runs one forward pass per PDE description.
-
-    Selection of the text to embed is controlled by `cfg.prompt_style`:
-        - "declarative"      : PDE_DESCRIPTIONS[key], max_length=128 (original)
-        - "declarative_long" : PDE_DESCRIPTIONS[key], max_length=cfg.cot_max_length
-        - "cot_generated"    : TinyLlama-generated reasoning (cached), max_length=cfg.cot_max_length
+    Two orthogonal features:
+      1. `cfg.prompt_style` selects the text that gets embedded:
+           - "declarative"      : PDE_DESCRIPTIONS[key], max_length=128
+           - "declarative_long" : PDE_DESCRIPTIONS[key], max_length=cfg.cot_max_length
+           - "cot_generated"    : TinyLlama-generated reasoning (cached to
+                                  cfg.cot_cache_dir), max_length=cfg.cot_max_length
+      2. `embeddings_dir` is an optional .npy disk cache for the final unit-
+         normalized z vectors — useful when PyTorch and JAX conflict over CUDA
+         versions so you can precompute once under PyTorch and skip the LLM
+         at train time. The cache is keyed by prompt_style so different styles
+         produce separate cache subdirectories.
 
     Returns:
-        embeddings : Dict[scenario_key -> z]
-                     z is float32 numpy, shape (hidden_dim,), unit-normalized
-        embed_dim  : int — the model's hidden dimension (set this as Config.z_embed_dim)
+        embeddings : Dict[scenario_key -> z]  float32, unit-normalized
+        embed_dim  : int — the model's hidden dimension
     """
+    import pathlib
+
+    style = getattr(cfg, "prompt_style", "declarative") if cfg is not None else "declarative"
+
+    # ── Try loading from disk-cached embeddings first ────────────────────────
+    # Cache layout:  <embeddings_dir>/<style>/<scenario_key>.npy
+    # (older Manhar layout without style subdir still works for declarative.)
+    if embeddings_dir is not None:
+        cache_root = pathlib.Path(embeddings_dir)
+        cache_dir = cache_root / style if style != "declarative" else cache_root
+        dim_file = cache_dir / "embed_dim.txt"
+        all_exist = dim_file.exists() and all(
+            (cache_dir / f"{key}.npy").exists() for key in scenario_keys
+        )
+        if all_exist:
+            print(f"  Loading precomputed embeddings from {cache_dir}/")
+            embed_dim = int(dim_file.read_text().strip())
+            embeddings: Dict[str, np.ndarray] = {}
+            for key in scenario_keys:
+                z = np.load(cache_dir / f"{key}.npy")
+                embeddings[key] = z
+                print(f"  z[{key}]  style={style}  shape={z.shape}  norm={np.linalg.norm(z):.4f}")
+            return embeddings, embed_dim
+
+    # ── Compute inline ───────────────────────────────────────────────────────
     tokenizer, model, arch, hidden_dim, backend = _load_model(model_name)
     embed_fn = _embed_flax if backend == "flax" else _embed_torch
 
-    style = getattr(cfg, "prompt_style", "declarative") if cfg is not None else "declarative"
-    if style == "declarative":
-        max_len = 128
-    else:
-        max_len = getattr(cfg, "cot_max_length", 512)
+    max_len = 128 if style == "declarative" else getattr(cfg, "cot_max_length", 512)
 
-    # ── Resolve the string to embed for each scenario ───────────────────────
+    # Resolve the string to embed for each scenario
     texts: Dict[str, str] = {}
     for key in scenario_keys:
         declarative = PDE_DESCRIPTIONS.get(key, key)
@@ -434,8 +459,8 @@ def precompute_embeddings(
                 "Expected one of: 'declarative', 'declarative_long', 'cot_generated'."
             )
 
-    # ── Embed each text, unit-normalize, collect ────────────────────────────
-    embeddings: Dict[str, np.ndarray] = {}
+    # Embed each text, unit-normalize, collect
+    embeddings = {}
     for key in scenario_keys:
         z = embed_fn(texts[key], tokenizer, model, arch, max_length=max_len)
         z = z / (np.linalg.norm(z) + 1e-8)

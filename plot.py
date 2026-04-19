@@ -157,26 +157,43 @@ def build_palette(conditions: List[str]) -> Dict[str, str]:
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
-def load_all(cfg: Config, results_dir: pathlib.Path = None) -> pd.DataFrame:
-    """Load and concatenate all result CSVs from results_dir."""
+def load_all(cfg: Config, results_dir: pathlib.Path = None, baseline_dir: pathlib.Path = None) -> pd.DataFrame:
+    """
+    Load and concatenate all result CSVs.
+    - Baseline CSVs loaded from baseline_dir (falls back to cfg.phase1_results_dir, then results_dir)
+    - Phase 2 CSVs loaded from results_dir
+    """
     if results_dir is None:
         results_dir = RESULTS_DIR
+    if baseline_dir is None:
+        baseline_dir = pathlib.Path(cfg.phase1_results_dir) if cfg.phase1_results_dir else results_dir
 
     all_pdes = set(cfg.pde_scenarios)
     dfs = []
     for pde in cfg.pde_scenarios:
         longer_pdes = {p for p in all_pdes if p != pde and p.startswith(pde + "_")}
+
+        # Load baseline from baseline_dir
+        baseline_csv = baseline_dir / f"{pde}_baseline.csv"
+        if baseline_csv.exists():
+            df = pd.read_csv(baseline_csv)
+            df["condition"] = "baseline"
+            df["pde"] = pde
+            dfs.append(df)
+        else:
+            print(f"  [warn] no baseline CSV for {pde} in {baseline_dir}")
+
+        # Load Phase 2 CSVs from results_dir (skip baseline — already loaded)
         for csv_path in sorted(results_dir.glob(f"{pde}_*.csv")):
             if any(csv_path.stem.startswith(p + "_") for p in longer_pdes):
                 continue
             label = csv_path.stem[len(pde) + 1:]
+            if label == "baseline":
+                continue   # already loaded from baseline_dir
             df = pd.read_csv(csv_path)
             df["condition"] = label
             df["pde"] = pde
             dfs.append(df)
-
-        if not (results_dir / f"{pde}_baseline.csv").exists():
-            print(f"  [warn] no baseline CSV for {pde} in {results_dir}")
 
     if not dfs:
         raise FileNotFoundError(
@@ -474,12 +491,13 @@ def main():
 
     cfg = Config()
     results_dir = pathlib.Path(args.results_dir) if args.results_dir else pathlib.Path(cfg.results_dir)
+    baseline_dir = pathlib.Path(cfg.phase1_results_dir) if cfg.phase1_results_dir else results_dir
     figures_dir = pathlib.Path(args.figures_dir) if args.figures_dir else pathlib.Path(cfg.figures_dir)
     suffix = f"_{args.suffix}" if args.suffix else ""
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading results ...")
-    data = load_all(cfg, results_dir=results_dir)
+    data = load_all(cfg, results_dir=results_dir, baseline_dir=baseline_dir)
     conditions = sorted(data["condition"].unique()) if "condition" in data.columns else []
     print(f"  PDEs: {data['pde'].nunique()}  "
           f"Seeds: {data['seed'].nunique()}  "

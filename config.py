@@ -80,7 +80,7 @@ class Config:
     sg_mlp_depth: int = 2     # number of hidden layers
 
     # ── Training (Phase 1) ────────────────────────────────────────────────────
-    num_train_steps: int = 20000
+    num_train_steps: int = 30000
     num_train_samples: int = 1000
     batch_size: int = 50
     train_temporal_horizon: int = 50
@@ -91,7 +91,7 @@ class Config:
 
     # Steps for joint fine-tuning (freeze_fno_trunk=False). Fewer than
     # phase2_train_steps to reduce risk of trunk drifting from Phase 1 solution.
-    phase2_joint_train_steps: int = 2000
+    phase2_joint_train_steps: int = 10000
 
     # If True, FNO trunk (lifting, blocks, projection) is frozen — only z_proj
     # and conditioning layers are trained. Clean ablation: measures what language
@@ -106,18 +106,23 @@ class Config:
 
     # ── Seeds ─────────────────────────────────────────────────────────────────
     # APEBench vmaps over seeds automatically — gives mean ± CI for free.
-    num_seeds: int = 3
+    num_seeds: int = 5
 
     # ── Output ────────────────────────────────────────────────────────────────
-    results_dir: str = "results/fno_12_64_6_gelu_train_20000_1000_50_50_test_100"       # CSVs saved here for plotting
-    figures_dir: str = "figures/fno_12_64_6_gelu_train_20000_1000_50_50_test_100"       # figures saved here by plot.py
-    checkpoints_dir: str = "checkpoints/fno_12_64_6_gelu_train_20000_1000_50_50_test_100"  # model checkpoints
+    results_dir: str = "results/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"       # CSVs saved here for plotting
+    figures_dir: str = "figures/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"       # figures saved here by plot.py
+    checkpoints_dir: str = "checkpoints/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"  # model checkpoints
+    embeddings_dir: str = "embeddings"   # precomputed LLM embeddings (optional, for CUDA conflict workaround)
 
     # If set, Phase 2 loads Phase 1 baseline checkpoints from this directory
     # instead of checkpoints_dir. Useful when pointing Phase 2 at a fixed
     # Phase 1 run stored in a different folder.
     # Leave as None to use checkpoints_dir for both reading and writing.
-    phase1_checkpoints_dir: Optional[str] = "checkpoints/fno_12_64_6_gelu_train_20000_1000_50_50_test_100"
+    phase1_checkpoints_dir: Optional[str] = "checkpoints/fno_12_64_6_gelu_train_30000_1000_50_50_test_100"
+
+    # If set, Phase 2 reads Phase 1 baseline CSVs from this directory for the
+    # summary table comparison. Leave as None to use results_dir.
+    phase1_results_dir: Optional[str] = "results/fno_12_64_6_gelu_train_30000_1000_50_50_test_100"
 
     # ── Derived APEBench config strings ──────────────────────────────────────
 

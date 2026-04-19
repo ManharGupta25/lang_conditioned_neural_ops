@@ -26,7 +26,28 @@ To change the LLM, edit Config.llm_model_name in config.py.
 """
 
 import argparse
+import os
 import pathlib
+
+# ── Reproducibility across GPU architectures ──────────────────────────────────
+# All env vars must be set before JAX is imported so XLA/CUDA pick them up.
+#
+# NVIDIA_TF32_OVERRIDE=0: disables TF32 on A100/H100 for all CUDA ops.
+#   jax_default_matmul_precision has NO effect on GPU (TPU only) — this
+#   env var is the correct way to force full float32 matmuls on Ampere/Hopper.
+# --xla_gpu_deterministic_ops: forces deterministic implementations for all
+#   GPU ops (reductions, scatter, atomics) at a small performance cost.
+# --xla_gpu_autotune_level=0: disables runtime kernel autotuning so XLA
+#   selects the same algorithm on every GPU type (significant slowdown).
+# CUDA_LAUNCH_BLOCKING=1: serialises kernel launches for full determinism.
+os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # deterministic cuBLAS workspace
+os.environ["XLA_FLAGS"] = (
+    os.environ.get("XLA_FLAGS", "") +
+    " --xla_gpu_deterministic_ops=true"
+    " --xla_gpu_autotune_level=0"
+)
 
 import equinox as eqx
 import jax
@@ -37,6 +58,15 @@ from apebench.scenarios import scenario_dict
 from config import Config
 from data.embeddings import precompute_embeddings
 from models.conditioned_fno import ConditionedFNO
+
+_ACTIVATIONS = {
+    "gelu": jax.nn.gelu,
+    "relu": jax.nn.relu,
+    "tanh": jnp.tanh,
+    "silu": jax.nn.silu,
+    "swish": jax.nn.swish,
+    "elu": jax.nn.elu,
+}
 
 
 
@@ -134,7 +164,7 @@ def _build_warmstarted_batch(
             num_modes=cfg.fno_modes,
             hidden_channels=cfg.fno_hidden,
             num_blocks=cfg.fno_blocks,
-            activation=jax.nn.gelu,
+            activation=_ACTIVATIONS[cfg.fno_activation],
             z_embed=z,
             cond_dim=cfg.z_cond_dim,
             conditioning_method=cfg.conditioning_method,
@@ -266,12 +296,14 @@ def run_phase2(cfg: Config):
     print(f"LLM       : {cfg.llm_model_name}")
     print(f"Prompt    : {cfg.prompt_style}")
     print(f"Trunk     : {'frozen' if cfg.freeze_fno_trunk else 'jointly fine-tuned'}")
-    print(f"Steps     : {cfg.phase2_train_steps}")
+    print(f"Steps     : {cfg.phase2_train_steps if cfg.freeze_fno_trunk else cfg.phase2_joint_train_steps}")
     print("=" * 65)
 
     print("\nPrecomputing language embeddings ...")
     embeddings, embed_dim = precompute_embeddings(
-        cfg.pde_scenarios, cfg.llm_model_name, cfg=cfg,
+        cfg.pde_scenarios, cfg.llm_model_name,
+        cfg=cfg,
+        embeddings_dir=str(pathlib.Path(cfg.embeddings_dir) / cfg.llm_short_name()),
     )
     cfg.z_embed_dim = embed_dim
     print(f"z_embed_dim = {embed_dim}\n")
@@ -336,9 +368,10 @@ def run_phase2(cfg: Config):
     header = f"{'PDE':<22}  {'Baseline':>10}  {'Conditioned':>12}  {'Delta':>8}"
     print(header)
     print("-" * len(header))
+    p1_results = pathlib.Path(cfg.phase1_results_dir) if cfg.phase1_results_dir else results_dir
     for key in cfg.pde_scenarios:
         cond = summary.get(key, float("nan"))
-        p1_csv = results_dir / f"{key}_baseline.csv"
+        p1_csv = p1_results / f"{key}_baseline.csv"
         base = _final_metric(pd.read_csv(p1_csv)) if p1_csv.exists() else float("nan")
         delta = cond - base
         sign = "+" if delta >= 0 else ""
