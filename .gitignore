@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# Caches — ignore everything except the CoT-generated reasoning JSONs,
+# which we commit so runs are reproducible across machines without
+# regenerating from the LLM.
+cache/
+!cache/cot_generated/
+!cache/cot_generated/**
+
+# SLURM logs
+slurm_logs/
+
+# Editor
+.vscode/
+.idea/

@@ -44,6 +44,20 @@ class Config:
     # It is written here as a placeholder that gets filled in train.py after loading.
     z_embed_dim: Optional[int] = None
 
+    # ── Prompt style (CoT ablation) ───────────────────────────────────────────
+    # Controls what text is embedded by the LLM to produce z.
+    #   "declarative"      — current PDE_DESCRIPTIONS, embedded at max_length=128
+    #   "declarative_long" — same text, embedded at cot_max_length (control for
+    #                        longer-sequence pooling without richer content)
+    #   "cot_generated"    — TinyLlama.generate() produces a 5-step reasoning
+    #                        trace; cached to disk and embedded at cot_max_length
+    prompt_style: str = "declarative"
+    cot_max_length: int = 512
+    cot_gen_max_new_tokens: int = 400
+    cot_gen_temperature: float = 0.0
+    cot_gen_seed: int = 0
+    cot_cache_dir: str = "cache/cot_generated"
+
     # ── FNO architecture ──────────────────────────────────────────────────────
     # Shared between baseline FNO and conditioned FNO.
     fno_modes: int = 12
@@ -119,12 +133,16 @@ class Config:
 
     def phase2_label(self) -> str:
         """Label used for Phase 2 checkpoint and CSV filenames.
-        Encodes conditioning method, LLM, and freeze state.
+        Encodes conditioning method, LLM, prompt style, and freeze state.
         e.g. 'film_distilbert', 'spectral_gating_tinyllama',
-             'film_tinyllama_joint' (when freeze_fno_trunk=False)
+             'film_tinyllama_joint' (when freeze_fno_trunk=False),
+             'spectral_gating_tinyllama_cot_generated',
+             'film_tinyllama_declarative_long_joint'
+        The declarative style adds no tag so existing runs keep their labels.
         """
         suffix = "_joint" if not self.freeze_fno_trunk else ""
-        return f"{self.conditioning_method}_{self.llm_short_name()}{suffix}"
+        style_tag = "" if self.prompt_style == "declarative" else f"_{self.prompt_style}"
+        return f"{self.conditioning_method}_{self.llm_short_name()}{style_tag}{suffix}"
 
     def fno_network_config(self) -> str:
         """Network config string for the plain baseline FNO."""

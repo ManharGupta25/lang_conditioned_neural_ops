@@ -264,13 +264,14 @@ def run_phase2(cfg: Config):
     print("\n" + "=" * 65)
     print(f"PHASE 2  —  Conditioned FNO  ({cfg.num_seeds} seeds per PDE)")
     print(f"LLM       : {cfg.llm_model_name}")
+    print(f"Prompt    : {cfg.prompt_style}")
     print(f"Trunk     : {'frozen' if cfg.freeze_fno_trunk else 'jointly fine-tuned'}")
     print(f"Steps     : {cfg.phase2_train_steps}")
     print("=" * 65)
 
     print("\nPrecomputing language embeddings ...")
     embeddings, embed_dim = precompute_embeddings(
-        cfg.pde_scenarios, cfg.llm_model_name,
+        cfg.pde_scenarios, cfg.llm_model_name, cfg=cfg,
     )
     cfg.z_embed_dim = embed_dim
     print(f"z_embed_dim = {embed_dim}\n")
@@ -369,6 +370,12 @@ def main():
         "--scenarios", nargs="+", default=None,
         help="Run only these PDE scenarios (e.g. --scenarios phy_adv phy_ks)",
     )
+    parser.add_argument(
+        "--prompt-style",
+        choices=["declarative", "declarative_long", "cot_generated"],
+        default=None,
+        help="Prompt strategy used to build z from the LLM (Phase 2 only)",
+    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -378,6 +385,8 @@ def main():
         cfg.freeze_fno_trunk = args.freeze_trunk.lower() == "true"
     if args.scenarios is not None:
         cfg.pde_scenarios = args.scenarios
+    if args.prompt_style is not None:
+        cfg.prompt_style = args.prompt_style
     print("=" * 65)
     print("Language-Conditioned Neural Operators  (APEBench + JAX)")
     print("=" * 65)

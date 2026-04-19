@@ -206,7 +206,7 @@ def _mean_pool(hidden, attention_mask):
     return (hidden * mask).sum(axis=1) / mask.sum(axis=1)  # (1, H)
 
 
-def _embed_flax(text: str, tokenizer, model, arch: str) -> np.ndarray:
+def _embed_flax(text: str, tokenizer, model, arch: str, max_length: int = 128) -> np.ndarray:
     """Extract a 1-D embedding using a Flax model.
 
     Mean pools over all non-padding token hidden states for all model types.
@@ -217,7 +217,7 @@ def _embed_flax(text: str, tokenizer, model, arch: str) -> np.ndarray:
         return_tensors="jax",
         padding=True,
         truncation=True,
-        max_length=128,
+        max_length=max_length,
     )
 
     if arch == "encoder_decoder":
@@ -231,7 +231,7 @@ def _embed_flax(text: str, tokenizer, model, arch: str) -> np.ndarray:
     return np.array(z[0], dtype=np.float32)
 
 
-def _embed_torch(text: str, tokenizer, model, arch: str) -> np.ndarray:
+def _embed_torch(text: str, tokenizer, model, arch: str, max_length: int = 128) -> np.ndarray:
     """Extract a 1-D embedding using a PyTorch model (fallback).
 
     Mean pools over all non-padding token hidden states for all model types.
@@ -244,7 +244,7 @@ def _embed_torch(text: str, tokenizer, model, arch: str) -> np.ndarray:
         return_tensors="pt",
         padding=True,
         truncation=True,
-        max_length=128,
+        max_length=max_length,
     )
 
     with torch.no_grad():
@@ -258,17 +258,153 @@ def _embed_torch(text: str, tokenizer, model, arch: str) -> np.ndarray:
         return z[0].cpu().numpy().astype(np.float32)
 
 
+# ── Chain-of-thought generation + caching ────────────────────────────────────
+
+def _build_cot_user_prompt(scenario_key: str, declarative: str) -> str:
+    """The user turn we send to TinyLlama-Chat."""
+    return (
+        "You are analyzing a partial differential equation (PDE) for a "
+        "numerical solver. Reason step by step.\n\n"
+        f"PDE description: {declarative}\n\n"
+        "Produce a concise analysis:\n"
+        "Step 1 — Identify the equation and its canonical form.\n"
+        "Step 2 — Classify each term (convection / diffusion / dispersion / reaction).\n"
+        "Step 3 — Compare the relative scales of those terms.\n"
+        "Step 4 — Describe the expected qualitative dynamics.\n"
+        "Step 5 — Note the implication for a neural-operator solver on this domain.\n"
+        "Keep each step to 1–2 sentences."
+    )
+
+
+def _apply_chat_template(tokenizer, user_prompt: str) -> str:
+    """Render the tokenizer's chat template (TinyLlama-Chat ships one)."""
+    assert tokenizer.chat_template is not None, (
+        "Tokenizer has no chat_template; TinyLlama-Chat-v1.0 ships one. "
+        "If you swapped models, add a manual <|system|>/<|user|>/<|assistant|> fallback."
+    )
+    messages = [
+        {"role": "system", "content": "You are an expert in partial differential equations and numerical analysis."},
+        {"role": "user",   "content": user_prompt},
+    ]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def _cot_cache_key(
+    model_name: str,
+    scenario_key: str,
+    user_prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+) -> str:
+    """Content-addressed cache key — any input change invalidates the cache."""
+    import hashlib
+    payload = "\x1f".join([
+        model_name, scenario_key, user_prompt,
+        str(max_new_tokens), f"{temperature:.4f}",
+    ]).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _generate_cot_torch(
+    tokenizer,
+    user_prompt: str,
+    model_name: str,
+    max_new_tokens: int,
+    temperature: float,
+    seed: int,
+) -> str:
+    """Run .generate() under PyTorch (Flax Llama has no causal LM head).
+    Greedy when temperature == 0.0.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    torch.manual_seed(seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    lm = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+    lm.to(device)
+    lm.eval()
+
+    prompt_text = _apply_chat_template(tokenizer, user_prompt)
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    do_sample = temperature > 0.0
+    with torch.no_grad():
+        out = lm.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature if do_sample else 1.0,
+            num_beams=1,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    reply_ids = out[0, inputs["input_ids"].shape[1]:]
+    text = tokenizer.decode(reply_ids, skip_special_tokens=True).strip()
+    del lm
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return text
+
+
+def _resolve_cot_text(
+    scenario_key: str,
+    declarative: str,
+    cfg,
+    tokenizer,
+) -> str:
+    """Return CoT text for a scenario — from disk cache if present, else generate + persist."""
+    import json
+    import pathlib
+
+    user_prompt = _build_cot_user_prompt(scenario_key, declarative)
+    cache_dir = pathlib.Path(cfg.cot_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = _cot_cache_key(
+        cfg.llm_model_name, scenario_key, user_prompt,
+        cfg.cot_gen_max_new_tokens, cfg.cot_gen_temperature,
+    )
+    path = cache_dir / f"{scenario_key}_{key}.json"
+    if path.exists():
+        print(f"  CoT cache hit  : {path}")
+        return json.loads(path.read_text())["cot_text"]
+
+    print(f"  CoT generating : {scenario_key} (greedy, max_new_tokens={cfg.cot_gen_max_new_tokens})")
+    text = _generate_cot_torch(
+        tokenizer, user_prompt, cfg.llm_model_name,
+        cfg.cot_gen_max_new_tokens, cfg.cot_gen_temperature, cfg.cot_gen_seed,
+    )
+    record = {
+        "scenario_key":   scenario_key,
+        "model_name":     cfg.llm_model_name,
+        "user_prompt":    user_prompt,
+        "cot_text":       text,
+        "max_new_tokens": cfg.cot_gen_max_new_tokens,
+        "temperature":    cfg.cot_gen_temperature,
+        "seed":           cfg.cot_gen_seed,
+        "cache_key":      key,
+    }
+    path.write_text(json.dumps(record, indent=2))
+    print(f"  CoT cached     : {path}")
+    return text
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def precompute_embeddings(
     scenario_keys: List[str],
     model_name: str,
+    cfg=None,
 ) -> Tuple[Dict[str, np.ndarray], int]:
     """
     Precompute language embeddings for all requested PDE scenarios.
 
     Loads `model_name` once (Flax if supported, PyTorch otherwise).
     Runs one forward pass per PDE description.
+
+    Selection of the text to embed is controlled by `cfg.prompt_style`:
+        - "declarative"      : PDE_DESCRIPTIONS[key], max_length=128 (original)
+        - "declarative_long" : PDE_DESCRIPTIONS[key], max_length=cfg.cot_max_length
+        - "cot_generated"    : TinyLlama-generated reasoning (cached), max_length=cfg.cot_max_length
 
     Returns:
         embeddings : Dict[scenario_key -> z]
@@ -278,13 +414,35 @@ def precompute_embeddings(
     tokenizer, model, arch, hidden_dim, backend = _load_model(model_name)
     embed_fn = _embed_flax if backend == "flax" else _embed_torch
 
+    style = getattr(cfg, "prompt_style", "declarative") if cfg is not None else "declarative"
+    if style == "declarative":
+        max_len = 128
+    else:
+        max_len = getattr(cfg, "cot_max_length", 512)
+
+    # ── Resolve the string to embed for each scenario ───────────────────────
+    texts: Dict[str, str] = {}
+    for key in scenario_keys:
+        declarative = PDE_DESCRIPTIONS.get(key, key)
+        if style in ("declarative", "declarative_long"):
+            texts[key] = declarative
+        elif style == "cot_generated":
+            texts[key] = _resolve_cot_text(key, declarative, cfg, tokenizer)
+        else:
+            raise ValueError(
+                f"Unknown prompt_style: {style!r}. "
+                "Expected one of: 'declarative', 'declarative_long', 'cot_generated'."
+            )
+
+    # ── Embed each text, unit-normalize, collect ────────────────────────────
     embeddings: Dict[str, np.ndarray] = {}
     for key in scenario_keys:
-        text = PDE_DESCRIPTIONS.get(key, key)
-        z = embed_fn(text, tokenizer, model, arch)
-        # Unit-normalize for numerical stability
+        z = embed_fn(texts[key], tokenizer, model, arch, max_length=max_len)
         z = z / (np.linalg.norm(z) + 1e-8)
         embeddings[key] = z
-        print(f"  z[{key}]  shape={z.shape}  norm={np.linalg.norm(z):.4f}")
+        print(
+            f"  z[{key}]  style={style}  shape={z.shape}  "
+            f"text_chars={len(texts[key])}  norm={np.linalg.norm(z):.4f}"
+        )
 
     return embeddings, hidden_dim
