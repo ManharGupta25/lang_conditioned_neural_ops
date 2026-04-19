@@ -1,1 +1,4 @@
 checkpoints/ filter=lfs diff=lfs merge=lfs -text
+results/** filter=lfs diff=lfs merge=lfs -text
+checkpoints/** filter=lfs diff=lfs merge=lfs -text
+*.eqx filter=lfs diff=lfs merge=lfs -text
