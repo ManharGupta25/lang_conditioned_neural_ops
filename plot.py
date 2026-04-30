@@ -487,6 +487,16 @@ def main():
     parser.add_argument("--results-dir", default=None)
     parser.add_argument("--figures-dir", default=None)
     parser.add_argument("--suffix", default="")
+    parser.add_argument(
+        "--conditions", default=None,
+        help="Comma-separated substrings to include (baseline always included). "
+             "E.g. --conditions distilbert,tinyllama",
+    )
+    parser.add_argument(
+        "--exclude", default=None,
+        help="Comma-separated substrings to exclude after --conditions filter. "
+             "E.g. --exclude cot_generated,declarative_long",
+    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -498,6 +508,23 @@ def main():
 
     print("Loading results ...")
     data = load_all(cfg, results_dir=results_dir, baseline_dir=baseline_dir)
+
+    if args.conditions:
+        filters = [s.strip() for s in args.conditions.split(",") if s.strip()]
+        data = data[
+            data["condition"].apply(
+                lambda c: c == "baseline" or any(f in c for f in filters)
+            )
+        ]
+
+    if args.exclude:
+        excludes = [s.strip() for s in args.exclude.split(",") if s.strip()]
+        data = data[
+            data["condition"].apply(
+                lambda c: c == "baseline" or not any(e in c for e in excludes)
+            )
+        ]
+
     conditions = sorted(data["condition"].unique()) if "condition" in data.columns else []
     print(f"  PDEs: {data['pde'].nunique()}  "
           f"Seeds: {data['seed'].nunique()}  "

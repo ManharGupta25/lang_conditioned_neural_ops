@@ -38,7 +38,7 @@ class Config:
     #   "meta-llama/Llama-2-7b-hf"        4096-dim decoder  7B params
     #   "mistralai/Mistral-7B-v0.1"       4096-dim decoder  7B params
     #
-    llm_model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    llm_model_name: str = "distilbert-base-uncased"
 
     # z_embed_dim is set automatically from the loaded model; do not set manually.
     # It is written here as a placeholder that gets filled in train.py after loading.
@@ -109,19 +109,18 @@ class Config:
     num_seeds: int = 5
 
     # ── Output ────────────────────────────────────────────────────────────────
-    results_dir: str = "results/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"       # CSVs saved here for plotting
-    figures_dir: str = "figures/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"       # figures saved here by plot.py
-    checkpoints_dir: str = "checkpoints/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"  # model checkpoints
-    embeddings_dir: str = "embeddings"   # precomputed LLM embeddings (optional, for CUDA conflict workaround)
+    # ── Phase 1 directories (active) ─────────────────────────────────────────
+    # Phase 1 saves baseline checkpoints and CSVs directly into checkpoints_dir
+    # and results_dir. Before running Phase 2, update these three to the phase2
+    # subdirectory paths below and set phase1_checkpoints_dir / phase1_results_dir
+    # to the current values so Phase 2 can find the baselines.
+    #
+    results_dir: str = "results/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"
+    figures_dir: str = "figures/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"
+    checkpoints_dir: str = "checkpoints/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"
+    embeddings_dir: str = "embeddings"
 
-    # If set, Phase 2 loads Phase 1 baseline checkpoints from this directory
-    # instead of checkpoints_dir. Useful when pointing Phase 2 at a fixed
-    # Phase 1 run stored in a different folder.
-    # Leave as None to use checkpoints_dir for both reading and writing.
     phase1_checkpoints_dir: Optional[str] = "checkpoints/fno_12_64_6_gelu_train_30000_1000_50_50_test_100"
-
-    # If set, Phase 2 reads Phase 1 baseline CSVs from this directory for the
-    # summary table comparison. Leave as None to use results_dir.
     phase1_results_dir: Optional[str] = "results/fno_12_64_6_gelu_train_30000_1000_50_50_test_100"
 
     # ── Derived APEBench config strings ──────────────────────────────────────
