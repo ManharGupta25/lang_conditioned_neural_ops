@@ -45,8 +45,8 @@ PDE_DESCRIPTIONS: Dict[str, str] = {
         "u_t + 0.125 * u * u_x = 0.0003 * u_xx."
     ),
     "phy_diff": (
-        "Diffusion equation with diffusion coefficient 0.008, purely dissipative "
-        "dynamics, periodic boundary conditions, 1D spatial domain, "
+        "Diffusion equation with diffusion coefficient 0.008, purely dissipative dynamics, "
+        "periodic boundary conditions, 1D spatial domain, "
         "domain extent 1.0, timestep 0.1. "
         "Smooths spatial gradients over time: u_t = 0.008 * u_xx."
     ),
@@ -107,6 +107,15 @@ PDE_DESCRIPTIONS: Dict[str, str] = {
         "Diffusion coefficient 0.004, linear growth rate 20.0, "
         "quadratic decay coefficient 20.0: "
         "u_t = 0.004 * u_xx + 20.0 * u * (1 - u)."
+    ),
+    "phy_sh": (
+        "Swift-Hohenberg equation for pattern formation, periodic boundary conditions, "
+        "1D spatial domain, domain extent 10π ≈ 31.416, timestep 0.1. "
+        "Reactivity parameter 0.7, critical wavenumber 1.0, cubic-quintic nonlinearity "
+        "with polynomial coefficients (1.0, -1.0): "
+        "u_t = -(1 + ∂ₓₓ)² u + 0.7 u + u³ - u⁵. "
+        "Fourth-order dissipation selects the preferred spatial wavelength; linear "
+        "instability and nonlinear saturation produce periodic stripe patterns."
     ),
 }
 
@@ -199,6 +208,95 @@ def _load_model(model_name: str):
 
 # ── Embedding extraction ──────────────────────────────────────────────────────
 
+def _embed_sentence_transformer(text: str, model) -> np.ndarray:
+    """Extract a 1-D embedding using the sentence-transformers library.
+
+    Pooling strategy (mean / CLS / etc.) is handled automatically by the
+    library according to each model's own pooling config, so this works
+    correctly for all-MiniLM (mean), BGE (CLS), SPECTER2 (adapter+CLS), etc.
+
+    Returns a float32 numpy array of shape (embed_dim,).
+    """
+    # encode() returns a numpy array by default; normalize_embeddings=False
+    # so we apply our own unit-normalization downstream (consistent with the
+    # AutoModel path).
+    z = model.encode(text, convert_to_numpy=True, normalize_embeddings=False)
+    return z.astype(np.float32)
+
+
+def _load_sentence_transformer(model_name: str):
+    """Load a model via the sentence-transformers library.
+
+    Returns (model, embed_dim).
+    Raises ImportError with a clear install hint if the library is absent.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise ImportError(
+            "sentence-transformers is not installed. "
+            "Run:  pip install sentence-transformers"
+        )
+    model = SentenceTransformer(model_name)
+    embed_dim = model.get_sentence_embedding_dimension()
+    return model, embed_dim
+
+
+def _load_adapter_model(model_name: str, base_model: str = "allenai/specter2_base"):
+    """Load an adapter-transformers model (SPECTER2 family) on top of a base.
+
+    model_name : HuggingFace adapter repo, e.g. "allenai/specter2"
+    base_model : foundation checkpoint the adapter attaches to
+
+    Returns (tokenizer, model, embed_dim).
+    Raises ImportError with a clear install hint if the adapters library is absent.
+    """
+    import torch
+    from transformers import AutoTokenizer
+    try:
+        from adapters import AutoAdapterModel
+    except ImportError:
+        raise ImportError(
+            "adapters library is not installed. "
+            "Run:  pip install adapters"
+        )
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    model = AutoAdapterModel.from_pretrained(base_model)
+    model.load_adapter(model_name, source="hf", load_as="proximity", set_active=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    embed_dim = model.config.hidden_size
+    return tokenizer, model, embed_dim
+
+
+def _embed_adapter(
+    text: str,
+    tokenizer,
+    model,
+    max_length: int = 512,
+) -> np.ndarray:
+    """Embed text using an adapter-transformers model.
+
+    Uses CLS-token pooling (SPECTER2 convention) rather than mean pooling.
+    """
+    import torch
+    inputs = tokenizer(
+        text,
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+        return_token_type_ids=False,
+        max_length=max_length,
+    )
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        out = model(**inputs)
+    z = out.last_hidden_state[:, 0, :]   # CLS token
+    return z[0].cpu().numpy().astype(np.float32)
+
+
 def _mean_pool(hidden, attention_mask):
     """Masked mean pool over sequence dimension. Works for both jax and numpy arrays."""
     import jax.numpy as jnp
@@ -206,36 +304,69 @@ def _mean_pool(hidden, attention_mask):
     return (hidden * mask).sum(axis=1) / mask.sum(axis=1)  # (1, H)
 
 
-def _embed_flax(text: str, tokenizer, model, arch: str) -> np.ndarray:
+def _embed_flax(
+    text: str,
+    tokenizer,
+    model,
+    arch: str,
+    max_length: int = 128,
+    layer_mode: str = "last",
+) -> np.ndarray:
     """Extract a 1-D embedding using a Flax model.
 
-    Mean pools over all non-padding token hidden states for all model types.
-    For encoder-decoder models, only the encoder side is used.
+    layer_mode="last"       : use final transformer layer hidden states only.
+    layer_mode="all_layers" : mean over all transformer block outputs (index 1..N,
+                              skipping the raw token embedding at index 0), then
+                              token-pool. Reduces next-token-prediction bias.
     """
+    import jax.numpy as jnp
+
     inputs = tokenizer(
         text,
         return_tensors="jax",
         padding=True,
         truncation=True,
-        max_length=128,
+        max_length=max_length,
     )
 
     if arch == "encoder_decoder":
-        encoder_out = model.encode(**{k: v for k, v in inputs.items()})
-        hidden = encoder_out.last_hidden_state          # (1, seq_len, H)
+        # Use model.encode() to avoid needing decoder_input_ids.
+        # output_hidden_states=True gives FlaxBaseModelOutput.hidden_states.
+        encoder_out = model.encode(
+            **{k: v for k, v in inputs.items()},
+            output_hidden_states=True,
+        )
+        all_hidden = encoder_out.hidden_states       # tuple, index 0 = embeddings
     else:
         outputs = model(**inputs, output_hidden_states=True)
-        hidden = outputs.last_hidden_state              # (1, seq_len, H)
+        all_hidden = outputs.hidden_states           # tuple, index 0 = embeddings
+
+    if layer_mode == "all_layers":
+        # Stack transformer block outputs (skip index 0 = raw embedding layer)
+        # each element: (1, seq_len, H) → stacked: (num_layers, 1, seq_len, H)
+        stacked = jnp.stack(all_hidden[1:], axis=0)
+        hidden = stacked.mean(axis=0)                # (1, seq_len, H)
+    else:
+        hidden = all_hidden[-1]                      # (1, seq_len, H)
 
     z = _mean_pool(hidden, inputs["attention_mask"])
     return np.array(z[0], dtype=np.float32)
 
 
-def _embed_torch(text: str, tokenizer, model, arch: str) -> np.ndarray:
+def _embed_torch(
+    text: str,
+    tokenizer,
+    model,
+    arch: str,
+    max_length: int = 128,
+    layer_mode: str = "last",
+) -> np.ndarray:
     """Extract a 1-D embedding using a PyTorch model (fallback).
 
-    Mean pools over all non-padding token hidden states for all model types.
-    For encoder-decoder models, only the encoder side is used.
+    layer_mode="last"       : use final transformer layer hidden states only.
+    layer_mode="all_layers" : mean over all transformer block outputs (index 1..N,
+                              skipping the raw token embedding at index 0), then
+                              token-pool. Reduces next-token-prediction bias.
     """
     import torch
 
@@ -244,18 +375,192 @@ def _embed_torch(text: str, tokenizer, model, arch: str) -> np.ndarray:
         return_tensors="pt",
         padding=True,
         truncation=True,
-        max_length=128,
+        max_length=max_length,
     )
 
     with torch.no_grad():
         if arch == "encoder_decoder":
-            hidden = model.encoder(**inputs).last_hidden_state
+            # Use model.encoder() to avoid needing decoder_input_ids.
+            encoder_out = model.encoder(**inputs, output_hidden_states=True)
+            all_hidden = encoder_out.hidden_states   # tuple, index 0 = embeddings
         else:
-            hidden = model(**inputs, output_hidden_states=True).last_hidden_state
+            outputs = model(**inputs, output_hidden_states=True)
+            all_hidden = outputs.hidden_states       # tuple, index 0 = embeddings
+
+        if layer_mode == "all_layers":
+            # Stack transformer block outputs (skip index 0 = raw embedding layer)
+            stacked = torch.stack(all_hidden[1:], dim=0)  # (num_layers, 1, seq_len, H)
+            hidden = stacked.mean(dim=0)                   # (1, seq_len, H)
+        else:
+            hidden = all_hidden[-1]                        # (1, seq_len, H)
 
         mask = inputs["attention_mask"].float().unsqueeze(-1)   # (1, seq_len, 1)
         z = (hidden * mask).sum(1) / mask.sum(1)                # (1, H)
         return z[0].cpu().numpy().astype(np.float32)
+
+
+# ── Chain-of-thought generation + caching ────────────────────────────────────
+
+def _build_cot_user_prompt(scenario_key: str, declarative: str) -> str:
+    """The user turn we send to TinyLlama-Chat."""
+    return (
+        "You are analyzing a partial differential equation (PDE) for a "
+        "numerical solver. Reason step by step.\n\n"
+        f"PDE description: {declarative}\n\n"
+        "Produce a concise analysis:\n"
+        "Step 1 — Identify the equation and its canonical form.\n"
+        "Step 2 — Classify each term (convection / diffusion / dispersion / reaction).\n"
+        "Step 3 — Compare the relative scales of those terms.\n"
+        "Step 4 — Describe the expected qualitative dynamics.\n"
+        "Step 5 — Note the implication for a neural-operator solver on this domain.\n"
+        "Keep each step to 1–2 sentences."
+    )
+
+
+def _apply_chat_template(tokenizer, user_prompt: str) -> str:
+    """Render the prompt for the generation model.
+
+    Uses the tokenizer's built-in chat_template when available (TinyLlama-Chat,
+    Llama-2-chat, Mistral-Instruct, etc.). Falls back to a generic
+    instruction-style format for base models that ship no chat_template.
+    """
+    system = "You are an expert in partial differential equations and numerical analysis."
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user_prompt},
+    ]
+    if tokenizer.chat_template is not None:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    # Generic fallback for base models (Llama-2-hf, GPT-2, etc.)
+    return (
+        f"### System:\n{system}\n\n"
+        f"### User:\n{user_prompt}\n\n"
+        f"### Assistant:\n"
+    )
+
+
+def _cot_cache_key(
+    model_name: str,
+    scenario_key: str,
+    user_prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+) -> str:
+    """Content-addressed cache key — any input change invalidates the cache."""
+    import hashlib
+    payload = "\x1f".join([
+        model_name, scenario_key, user_prompt,
+        str(max_new_tokens), f"{temperature:.4f}",
+    ]).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _generate_cot_torch(
+    tokenizer,
+    user_prompt: str,
+    model_name: str,
+    max_new_tokens: int,
+    temperature: float,
+    seed: int,
+    lm=None,
+) -> str:
+    """Run .generate() under PyTorch (Flax Llama has no causal LM head).
+    Greedy when temperature == 0.0.
+
+    lm : optional pre-loaded AutoModelForCausalLM. When provided the caller
+         owns the model lifecycle — it is not loaded or freed here. When None
+         the model is loaded, used, and immediately freed (single-call usage).
+    """
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    torch.manual_seed(seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    caller_owns = lm is not None
+    if not caller_owns:
+        # device_map="auto" splits layers across GPU + CPU RAM so models larger
+        # than single GPU VRAM can still load. Do NOT call .to(device) after —
+        # device_map already handled placement.
+        lm = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=torch.float32, device_map="auto"
+        )
+
+    # Always ensure eval mode regardless of who loaded the model.
+    lm.eval()
+
+    prompt_text = _apply_chat_template(tokenizer, user_prompt)
+    # Move inputs to whichever device holds the first layer (embedding table).
+    input_device = next(lm.parameters()).device
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(input_device)
+    do_sample = temperature > 0.0
+    with torch.no_grad():
+        out = lm.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature if do_sample else 1.0,
+            num_beams=1,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    reply_ids = out[0, inputs["input_ids"].shape[1]:]
+    text = tokenizer.decode(reply_ids, skip_special_tokens=True).strip()
+
+    if not caller_owns:
+        del lm
+        if device == "cuda":
+            torch.cuda.empty_cache()
+    return text
+
+
+def _resolve_cot_text(
+    scenario_key: str,
+    declarative: str,
+    cfg,
+    tokenizer,
+    lm=None,
+) -> str:
+    """Return CoT text for a scenario — from disk cache if present, else generate + persist.
+
+    lm : optional pre-loaded AutoModelForCausalLM passed through to
+         _generate_cot_torch. When None the generation function loads and
+         frees the model itself (correct only for single-scenario calls).
+    """
+    import json
+    import pathlib
+
+    user_prompt = _build_cot_user_prompt(scenario_key, declarative)
+    cache_dir = pathlib.Path(cfg.cot_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = _cot_cache_key(
+        cfg.llm_model_name, scenario_key, user_prompt,
+        cfg.cot_gen_max_new_tokens, cfg.cot_gen_temperature,
+    )
+    path = cache_dir / f"{scenario_key}_{key}.json"
+    if path.exists():
+        print(f"  CoT cache hit  : {path}")
+        return json.loads(path.read_text())["cot_text"]
+
+    print(f"  CoT generating : {scenario_key} (greedy, max_new_tokens={cfg.cot_gen_max_new_tokens})")
+    text = _generate_cot_torch(
+        tokenizer, user_prompt, cfg.llm_model_name,
+        cfg.cot_gen_max_new_tokens, cfg.cot_gen_temperature, cfg.cot_gen_seed,
+        lm=lm,
+    )
+    record = {
+        "scenario_key":   scenario_key,
+        "model_name":     cfg.llm_model_name,
+        "user_prompt":    user_prompt,
+        "cot_text":       text,
+        "max_new_tokens": cfg.cot_gen_max_new_tokens,
+        "temperature":    cfg.cot_gen_temperature,
+        "seed":           cfg.cot_gen_seed,
+        "cache_key":      key,
+    }
+    path.write_text(json.dumps(record, indent=2))
+    print(f"  CoT cached     : {path}")
+    return text
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -263,25 +568,50 @@ def _embed_torch(text: str, tokenizer, model, arch: str) -> np.ndarray:
 def precompute_embeddings(
     scenario_keys: List[str],
     model_name: str,
+    cfg=None,
     embeddings_dir: str = None,
 ) -> Tuple[Dict[str, np.ndarray], int]:
     """
     Precompute language embeddings for all requested PDE scenarios.
 
-    If embeddings_dir is set and all .npy files + embed_dim.txt exist there,
-    loads from disk instead of running the LLM — useful when PyTorch and JAX
-    conflict over CUDA versions. Otherwise computes inline as normal.
+    Two orthogonal features:
+      1. `cfg.prompt_style` selects the text that gets embedded:
+           - "declarative"      : PDE_DESCRIPTIONS[key], max_length=128
+           - "declarative_long" : PDE_DESCRIPTIONS[key], max_length=cfg.cot_max_length
+           - "cot_generated"    : TinyLlama-generated reasoning (cached to
+                                  cfg.cot_cache_dir), max_length=cfg.cot_max_length
+      2. `embeddings_dir` is an optional .npy disk cache for the final unit-
+         normalized z vectors — useful when PyTorch and JAX conflict over CUDA
+         versions so you can precompute once under PyTorch and skip the LLM
+         at train time. The cache is keyed by (embedding_backend, prompt_style,
+         embedding_layer_mode) so changing any setting produces a fresh directory.
 
     Returns:
-        embeddings : Dict[scenario_key -> z]
-                     z is float32 numpy, shape (hidden_dim,), unit-normalized
+        embeddings : Dict[scenario_key -> z]  float32, unit-normalized
         embed_dim  : int — the model's hidden dimension
     """
     import pathlib
 
-    # ── Try loading from disk first ───────────────────────────────────────────
+    style      = getattr(cfg, "prompt_style",        "declarative") if cfg is not None else "declarative"
+    layer_mode = getattr(cfg, "embedding_layer_mode", "last")       if cfg is not None else "last"
+    backend    = getattr(cfg, "embedding_backend",    "automodel")  if cfg is not None else "automodel"
+
+    # ── Try loading from disk-cached embeddings first ────────────────────────
+    # Cache layout:  <embeddings_dir>/<backend>_<style>_<layer_mode>/<key>.npy
+    # All three settings are included in the tag so changing any one produces
+    # a fresh directory rather than serving stale embeddings.
+    # Legacy layout (automodel + declarative + last → root dir) is preserved
+    # for backwards compatibility with previously precomputed files.
     if embeddings_dir is not None:
-        cache_dir = pathlib.Path(embeddings_dir)
+        cache_root = pathlib.Path(embeddings_dir)
+        cache_tag = f"{backend}_{style}_{layer_mode}"
+        cache_dir = cache_root / cache_tag
+        # Fallback: old layout had no subdirectory for automodel+declarative+last
+        if (not cache_dir.exists()
+                and backend == "automodel"
+                and style == "declarative"
+                and layer_mode == "last"):
+            cache_dir = cache_root
         dim_file = cache_dir / "embed_dim.txt"
         all_exist = dim_file.exists() and all(
             (cache_dir / f"{key}.npy").exists() for key in scenario_keys
@@ -293,19 +623,102 @@ def precompute_embeddings(
             for key in scenario_keys:
                 z = np.load(cache_dir / f"{key}.npy")
                 embeddings[key] = z
-                print(f"  z[{key}]  shape={z.shape}  norm={np.linalg.norm(z):.4f}")
+                print(f"  z[{key}]  backend={backend}  style={style}  layer_mode={layer_mode}  "
+                      f"shape={z.shape}  norm={np.linalg.norm(z):.4f}")
             return embeddings, embed_dim
 
-    # ── Compute inline ────────────────────────────────────────────────────────
-    tokenizer, model, arch, hidden_dim, backend = _load_model(model_name)
-    embed_fn = _embed_flax if backend == "flax" else _embed_torch
+    # ── Compute inline ───────────────────────────────────────────────────────
+    if backend in ("sentence_transformers", "adapter") and style == "cot_generated":
+        raise ValueError(
+            f"embedding_backend={backend!r} is incompatible with prompt_style='cot_generated'. "
+            "CoT generation requires a decoder LLM loaded via the automodel path. "
+            "Set embedding_backend='automodel' or switch prompt_style to "
+            "'declarative' or 'declarative_long'."
+        )
 
+    max_len = 128 if style == "declarative" else getattr(cfg, "cot_max_length", 512)
+
+    # ── Resolve texts ────────────────────────────────────────────────────────
+    # For cot_generated this happens BEFORE loading the embedding model so that
+    # the generation LLM and the embedding model are never in GPU memory at the
+    # same time. Both can be 7B+ parameters; overlapping them causes OOM kills.
+    texts: Dict[str, str] = {}
+    if style == "cot_generated":
+        import pathlib as _pl
+        import torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+
+        # Load just the tokenizer first — cheap, no GPU memory.
+        gen_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if gen_tokenizer.pad_token is None:
+            gen_tokenizer.pad_token = gen_tokenizer.eos_token
+
+        # Check which scenarios actually need generation (not yet cached).
+        needs_gen = []
+        for key in scenario_keys:
+            declarative = PDE_DESCRIPTIONS.get(key, key)
+            user_prompt = _build_cot_user_prompt(key, declarative)
+            cache_key = _cot_cache_key(
+                cfg.llm_model_name, key, user_prompt,
+                cfg.cot_gen_max_new_tokens, cfg.cot_gen_temperature,
+            )
+            cache_path = _pl.Path(cfg.cot_cache_dir) / f"{key}_{cache_key}.json"
+            if not cache_path.exists():
+                needs_gen.append(key)
+
+        # Load the generation model once only if at least one scenario needs it.
+        lm_gen = None
+        if needs_gen:
+            print(f"  Loading generation model for {len(needs_gen)} uncached scenario(s) ...")
+            lm_gen = AutoModelForCausalLM.from_pretrained(
+                model_name, dtype=torch.float32, device_map="auto"
+            )
+            lm_gen.eval()
+
+        for key in scenario_keys:
+            declarative = PDE_DESCRIPTIONS.get(key, key)
+            texts[key] = _resolve_cot_text(key, declarative, cfg, gen_tokenizer, lm=lm_gen)
+
+        # Free the generation model fully before loading the embedding model.
+        if lm_gen is not None:
+            del lm_gen
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    else:
+        for key in scenario_keys:
+            declarative = PDE_DESCRIPTIONS.get(key, key)
+            if style in ("declarative", "declarative_long"):
+                texts[key] = declarative
+            else:
+                raise ValueError(
+                    f"Unknown prompt_style: {style!r}. "
+                    "Expected one of: 'declarative', 'declarative_long', 'cot_generated'."
+                )
+
+    # ── Load embedding model (after generation model is fully freed) ──────────
+    if backend == "sentence_transformers":
+        model, hidden_dim = _load_sentence_transformer(model_name)
+        tokenizer = None
+    elif backend == "adapter":
+        tokenizer, model, hidden_dim = _load_adapter_model(model_name)
+    else:  # "automodel"
+        tokenizer, model, arch, hidden_dim, _load_backend = _load_model(model_name)
+        embed_fn = _embed_flax if _load_backend == "flax" else _embed_torch
+
+    # Embed each text, unit-normalize, collect
     embeddings = {}
     for key in scenario_keys:
-        text = PDE_DESCRIPTIONS.get(key, key)
-        z = embed_fn(text, tokenizer, model, arch)
+        if backend == "sentence_transformers":
+            z = _embed_sentence_transformer(texts[key], model)
+        elif backend == "adapter":
+            z = _embed_adapter(texts[key], tokenizer, model, max_length=max_len)
+        else:  # "automodel"
+            z = embed_fn(texts[key], tokenizer, model, arch, max_length=max_len, layer_mode=layer_mode)
         z = z / (np.linalg.norm(z) + 1e-8)
         embeddings[key] = z
-        print(f"  z[{key}]  shape={z.shape}  norm={np.linalg.norm(z):.4f}")
+        print(
+            f"  z[{key}]  backend={backend}  style={style}  layer_mode={layer_mode}  "
+            f"shape={z.shape}  text_chars={len(texts[key])}  norm={np.linalg.norm(z):.4f}"
+        )
 
     return embeddings, hidden_dim

@@ -68,15 +68,30 @@ _ACTIVATIONS = {
     "elu": jax.nn.elu,
 }
 
+# APEBench's SwiftHohenberg raises ValueError for 1D, but the underlying
+# exponax stepper supports all spatial dims (docstring: d ∈ {1, 2, 3}).
+# We subclass to remove the restriction and register the patched version.
+from apebench.scenarios.physical._swift_hohenberg import SwiftHohenberg as _SHBase
+
+class _SwiftHohenbergAllDims(_SHBase):
+    def __post_init__(self):
+        pass  # exponax stepper supports 1D/2D/3D; APEBench check is overly restrictive
+
+scenario_dict["phy_sh"] = _SwiftHohenbergAllDims
+
+# Per-scenario overrides for parameters that differ from cfg defaults.
+_SCENARIO_OVERRIDES: dict = {}
+
 
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_scenario(scenario_key: str, cfg: Config, optim_config: str = None):
+    overrides = _SCENARIO_OVERRIDES.get(scenario_key, {})
     return scenario_dict[scenario_key](
-        num_spatial_dims=cfg.num_spatial_dims,
-        num_points=cfg.num_points,
+        num_spatial_dims=overrides.get("num_spatial_dims", cfg.num_spatial_dims),
+        num_points=overrides.get("num_points", cfg.num_points),
         num_train_samples=cfg.num_train_samples,
         num_test_samples=cfg.num_test_samples,
         train_temporal_horizon=cfg.train_temporal_horizon,
@@ -139,6 +154,7 @@ def _build_warmstarted_batch(
     phase1_batch: eqx.Module,
     z_embed,
     cfg: Config,
+    num_spatial_dims: int = None,
 ) -> ConditionedFNO:
     """
     Build a [num_seeds]-batched ConditionedFNO where the FNO trunk of each
@@ -151,6 +167,7 @@ def _build_warmstarted_batch(
         3. Stack all seeds' leaf arrays along axis 0 to form a batched model.
     """
     z = jnp.array(z_embed)
+    n_dims = num_spatial_dims if num_spatial_dims is not None else cfg.num_spatial_dims
     cond_fno_list = []
 
     for i in range(cfg.num_seeds):
@@ -159,7 +176,7 @@ def _build_warmstarted_batch(
 
         # Build ConditionedFNO with random conditioning weights
         c_i = ConditionedFNO(
-            num_spatial_dims=cfg.num_spatial_dims,
+            num_spatial_dims=n_dims,
             num_channels=1,          # all current scenarios are 1-channel
             num_modes=cfg.fno_modes,
             hidden_channels=cfg.fno_hidden,
@@ -294,6 +311,7 @@ def run_phase2(cfg: Config):
     print("\n" + "=" * 65)
     print(f"PHASE 2  —  Conditioned FNO  ({cfg.num_seeds} seeds per PDE)")
     print(f"LLM       : {cfg.llm_model_name}")
+    print(f"Prompt    : {cfg.prompt_style}")
     print(f"Trunk     : {'frozen' if cfg.freeze_fno_trunk else 'jointly fine-tuned'}")
     print(f"Steps     : {cfg.phase2_train_steps if cfg.freeze_fno_trunk else cfg.phase2_joint_train_steps}")
     print("=" * 65)
@@ -301,6 +319,7 @@ def run_phase2(cfg: Config):
     print("\nPrecomputing language embeddings ...")
     embeddings, embed_dim = precompute_embeddings(
         cfg.pde_scenarios, cfg.llm_model_name,
+        cfg=cfg,
         embeddings_dir=str(pathlib.Path(cfg.embeddings_dir) / cfg.llm_short_name()),
     )
     cfg.z_embed_dim = embed_dim
@@ -317,7 +336,7 @@ def run_phase2(cfg: Config):
 
         # ── Step 2: build warm-started batched ConditionedFNO ─────────────────
         z = embeddings[scenario_key]
-        cond_fno_batch = _build_warmstarted_batch(phase1_batch, z, cfg)
+        cond_fno_batch = _build_warmstarted_batch(phase1_batch, z, cfg, num_spatial_dims=scenario.num_spatial_dims)
         print(f"  FNO trunk warm-started; conditioning={cfg.conditioning_method}.")
 
         # ── Step 3: vmap training over seeds ──────────────────────────────────
@@ -397,6 +416,16 @@ def main():
         "--freeze-trunk", choices=["true", "false"], default=None,
         help="Override freeze_fno_trunk: 'true' = frozen, 'false' = joint fine-tuning",
     )
+    parser.add_argument(
+        "--scenarios", nargs="+", default=None,
+        help="Run only these PDE scenarios (e.g. --scenarios phy_adv phy_ks)",
+    )
+    parser.add_argument(
+        "--prompt-style",
+        choices=["declarative", "declarative_long", "cot_generated"],
+        default=None,
+        help="Prompt strategy used to build z from the LLM (Phase 2 only)",
+    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -404,6 +433,10 @@ def main():
         cfg.conditioning_method = args.conditioning_method
     if args.freeze_trunk is not None:
         cfg.freeze_fno_trunk = args.freeze_trunk.lower() == "true"
+    if args.scenarios is not None:
+        cfg.pde_scenarios = args.scenarios
+    if args.prompt_style is not None:
+        cfg.prompt_style = args.prompt_style
     print("=" * 65)
     print("Language-Conditioned Neural Operators  (APEBench + JAX)")
     print("=" * 65)

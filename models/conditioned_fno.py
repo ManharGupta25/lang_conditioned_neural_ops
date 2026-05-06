@@ -108,37 +108,49 @@ class SpectralGating(eqx.Module):
     """
     gate_mlp: eqx.nn.MLP
     num_modes: int
+    num_spatial_dims: int
     alpha: float
 
     def __init__(
         self,
         cond_dim: int,
         num_modes: int,
+        num_spatial_dims: int = 1,
         mlp_width: int = 64,
         mlp_depth: int = 2,
         *,
         key: PRNGKeyArray,
     ):
+        # Gate output size scales with spatial dims: num_modes^D gate values
         self.gate_mlp = eqx.nn.MLP(
             in_size=cond_dim,
-            out_size=num_modes,
+            out_size=num_modes ** num_spatial_dims,
             width_size=mlp_width,
             depth=mlp_depth,
             key=key,
         )
         self.num_modes = num_modes
+        self.num_spatial_dims = num_spatial_dims
         self.alpha = 0.1
 
     def __call__(self, x: Array, z_cond: Array) -> Array:
-        # x      : (channels, spatial_dim)
+        # x      : (channels, *spatial_dims)
         # z_cond : (cond_dim,)
-        n = x.shape[-1]
-        x_hat = jnp.fft.rfft(x, axis=-1)                   # (channels, n//2+1)
-        gate_raw = self.gate_mlp(z_cond)                     # (num_modes,)
-        gate = 1.0 + self.alpha * jnp.tanh(gate_raw)        # (num_modes,)
-        # Multiply only the first num_modes frequency bins; broadcast over channels
-        x_hat = x_hat.at[:, :self.num_modes].multiply(gate[None, :])
-        return jnp.fft.irfft(x_hat, n=n, axis=-1)           # (channels, spatial_dim)
+        gate_raw = self.gate_mlp(z_cond)                      # (num_modes^D,)
+        gate = 1.0 + self.alpha * jnp.tanh(gate_raw)
+
+        if self.num_spatial_dims == 1:
+            n = x.shape[-1]
+            x_hat = jnp.fft.rfft(x, axis=-1)                 # (channels, n//2+1)
+            x_hat = x_hat.at[:, :self.num_modes].multiply(gate[None, :])
+            return jnp.fft.irfft(x_hat, n=n, axis=-1)
+
+        else:  # 2D: x is (channels, H, W)
+            spatial_shape = x.shape[1:]
+            x_hat = jnp.fft.rfft2(x)                          # (channels, H, W//2+1)
+            gate_2d = gate.reshape(self.num_modes, self.num_modes)
+            x_hat = x_hat.at[:, :self.num_modes, :self.num_modes].multiply(gate_2d[None, :, :])
+            return jnp.fft.irfft2(x_hat, s=spatial_shape)
 
 
 # ── ConditionedFNO ────────────────────────────────────────────────────────────
@@ -234,6 +246,7 @@ class ConditionedFNO(eqx.Module):
             SpectralGating(
                 cond_dim=cond_dim,
                 num_modes=num_modes,
+                num_spatial_dims=num_spatial_dims,
                 mlp_width=sg_mlp_width,
                 mlp_depth=sg_mlp_depth,
                 key=sg_keys[i],

@@ -3,19 +3,24 @@ plot.py — Generate comparison figures from Phase 1 and Phase 2 results.
 
 Reads CSVs from results/ and produces three figures in figures/:
 
-    nrmse_rollout.png      — nRMSE vs test timestep, baseline vs conditioned
-                             (one subplot per PDE, shaded 95% CI across seeds)
-    train_loss.png         — training loss vs update step
-                             (one subplot per PDE, shaded 95% CI across seeds)
-    final_nrmse_bar.png    — grouped bar chart of final-timestep nRMSE
-                             (error bars = std across seeds)
+    nrmse_rollout.png      — nRMSE vs test timestep (log y-axis)
+                             2×3 subplots, one per PDE, 95% CI across seeds,
+                             shared legend below the grid.
+    train_loss.png         — training loss vs update step (log y-axis)
+                             2×3 subplots with shared legend.
+    final_nrmse_bar.png    — final-timestep nRMSE bar chart
+                             2×3 subplots (one per PDE) so each gets its own
+                             y-scale and fair-error bars aren't crushed by
+                             the PDE with the largest error.
 
 Run after both training phases are complete:
     python plot.py
 """
 
 import argparse
+import math
 import pathlib
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -27,57 +32,130 @@ _cfg = Config()
 RESULTS_DIR = pathlib.Path(_cfg.results_dir)
 FIGURES_DIR = pathlib.Path(_cfg.figures_dir)
 
-_METHOD_PALETTE = {
-    "baseline":            "#4C72B0",
-    "film":                "#DD8452",
-    "spectral_gating":     "#55A868",
-    "film_joint":          "#C44E52",
-    "spectral_gating_joint": "#8172B2",
+
+# ── Condition parsing ────────────────────────────────────────────────────────
+#
+# Condition strings come from the `condition` column in each CSV and match the
+# Phase-2 label convention from config.phase2_label(). Examples:
+#
+#     baseline
+#     film_distilbert-base
+#     film_tinyllama-1.1b-chat-
+#     film_tinyllama-1.1b-chat-_joint
+#     film_tinyllama-1.1b-chat-_cot_generated
+#     film_tinyllama-1.1b-chat-_cot_generated_joint
+#     film_tinyllama-1.1b-chat-_declarative_long_joint
+#     spectral_gating_tinyllama-1.1b-chat-_cot_generated
+#
+# The parser peels the suffixes in a fixed order: _joint first, then prompt
+# style (cot_generated / declarative_long), then the method prefix. What's
+# left after method+underscore is the LLM short name.
+
+_PROMPT_STYLE_SUFFIXES = ("cot_generated", "declarative_long")
+_METHOD_PREFIXES = ("spectral_gating", "film")
+
+_METHOD_DISPLAY = {"baseline": "Baseline", "film": "FiLM", "spectral_gating": "SG"}
+_PROMPT_DISPLAY = {
+    "declarative":      "",          # default — omit from label
+    "declarative_long": "decl-long",
+    "cot_generated":    "CoT",
 }
-_METHOD_LABELS = {
-    "baseline":            "Baseline FNO",
-    "film":                "FiLM Conditioned",
-    "spectral_gating":     "Spectral Gating",
-    "film_joint":          "FiLM Joint Fine-Tuned",
-    "spectral_gating_joint": "SG Joint Fine-Tuned",
-}
 
 
-def _condition_to_method(condition: str) -> str:
-    """Extract conditioning method from a condition label.
-    'film_distilbert' -> 'film'
-    'spectral_gating_tinyllama' -> 'spectral_gating'
-    'film_tinyllama_joint' -> 'film_joint'
-    'spectral_gating_tinyllama_joint' -> 'spectral_gating_joint'
-    'baseline' -> 'baseline'
-    """
-    is_joint = condition.endswith("_joint")
-    cond = condition.removesuffix("_joint") if is_joint else condition
-    joint_suffix = "_joint" if is_joint else ""
-    for method in ("spectral_gating", "film", "baseline"):
-        if cond == method or cond.startswith(method + "_"):
-            return method + joint_suffix
-    return condition
+def _shorten_llm(llm_raw: str) -> str:
+    """'tinyllama-1.1b-chat-' → 'TinyLlama'; 'distilbert-base' → 'DistilBERT'."""
+    if llm_raw is None:
+        return ""
+    s = llm_raw.lower()
+    if "tinyllama" in s: return "TinyLlama"
+    if "distilbert" in s: return "DistilBERT"
+    if "gpt" in s: return "GPT"
+    if "llama" in s: return "Llama"
+    if "mistral" in s: return "Mistral"
+    return llm_raw.split("-")[0].title()
 
 
-def _condition_label(condition: str) -> str:
-    """Human-readable label for a condition string (includes LLM if present)."""
-    method = _condition_to_method(condition)
-    base = _METHOD_LABELS.get(method, condition)
-    # Append LLM name if encoded (e.g. 'film_distilbert' -> 'FiLM Conditioned (distilbert)')
-    parts = condition.split("_", maxsplit=len(method.split("_")))
-    llm_suffix = "_".join(parts[len(method.split("_")):])
-    if llm_suffix:
-        return f"{base} ({llm_suffix})"
-    return base
+def parse_condition(condition: str) -> Dict[str, object]:
+    """Extract {method, llm, prompt, joint} from a condition string."""
+    if condition == "baseline":
+        return {"method": "baseline", "llm": None, "prompt": "declarative", "joint": False}
+
+    s = condition
+    joint = s.endswith("_joint")
+    if joint:
+        s = s[: -len("_joint")]
+
+    prompt = "declarative"
+    for style in _PROMPT_STYLE_SUFFIXES:
+        if s.endswith("_" + style):
+            prompt = style
+            s = s[: -(len(style) + 1)]
+            break
+
+    method, llm = s, None
+    for m in _METHOD_PREFIXES:
+        if s == m:
+            method = m
+            break
+        if s.startswith(m + "_"):
+            method = m
+            llm = s[len(m) + 1:]
+            break
+
+    return {"method": method, "llm": llm, "prompt": prompt, "joint": joint}
 
 
-def _condition_color(condition: str) -> str:
-    method = _condition_to_method(condition)
-    return _METHOD_PALETTE.get(method, "#999999")
+def condition_label(condition: str) -> str:
+    """Short human-readable label for a condition. Unique per (method,llm,prompt,joint)."""
+    info = parse_condition(condition)
+    if info["method"] == "baseline":
+        return "Baseline"
+
+    method = _METHOD_DISPLAY.get(info["method"], info["method"])
+    parts: List[str] = []
+    if info["llm"]:
+        parts.append(_shorten_llm(info["llm"]))
+    if _PROMPT_DISPLAY.get(info["prompt"]):
+        parts.append(_PROMPT_DISPLAY[info["prompt"]])
+    if info["joint"]:
+        parts.append("joint")
+    return f"{method} ({', '.join(parts)})" if parts else method
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+def _sort_key(condition: str) -> Tuple:
+    """Canonical ordering so the same condition gets the same color/order
+    in every figure. Baseline first, then by method, LLM, prompt, trunk."""
+    info = parse_condition(condition)
+    method_rank = {"baseline": 0, "film": 1, "spectral_gating": 2}.get(info["method"], 9)
+    llm_rank = 0 if info["llm"] is None else (1 if "distilbert" in (info["llm"] or "") else 2)
+    prompt_rank = {"declarative": 0, "declarative_long": 1, "cot_generated": 2}.get(info["prompt"], 9)
+    joint_rank = 1 if info["joint"] else 0
+    return (method_rank, llm_rank, prompt_rank, joint_rank)
+
+
+# ── Color assignment ─────────────────────────────────────────────────────────
+
+def build_palette(conditions: List[str]) -> Dict[str, str]:
+    """One distinct color per condition, with baseline always black.
+    Groups related conditions by using hues from the same method family."""
+    ordered = sorted(set(conditions), key=_sort_key)
+
+    palette: Dict[str, str] = {}
+    # Separate baseline so it always reads as "the reference."
+    non_baseline = [c for c in ordered if parse_condition(c)["method"] != "baseline"]
+    if "baseline" in ordered:
+        palette["baseline"] = "#000000"
+
+    # Assign colors from a perceptually uniform palette sized to however many
+    # non-baseline conditions exist.
+    n = max(1, len(non_baseline))
+    colors = sns.color_palette("husl", n_colors=n)
+    for c, col in zip(non_baseline, colors):
+        palette[c] = col
+    return palette
+
+
+# ── Data loading ─────────────────────────────────────────────────────────────
 
 def load_all(cfg: Config, results_dir: pathlib.Path = None, baseline_dir: pathlib.Path = None) -> pd.DataFrame:
     """
@@ -90,9 +168,13 @@ def load_all(cfg: Config, results_dir: pathlib.Path = None, baseline_dir: pathli
     if baseline_dir is None:
         baseline_dir = pathlib.Path(cfg.phase1_results_dir) if cfg.phase1_results_dir else results_dir
 
-    # PDEs that share a prefix with another PDE (e.g. phy_adv vs phy_adv_diff)
-    # need special care so their globs don't bleed into each other.
+    # Discover all PDE names present in either directory (via *_baseline.csv)
+    # so that longer variants (e.g. phy_burgers_sc) are known when filtering
+    # globs for shorter names (e.g. phy_burgers).
     all_pdes = set(cfg.pde_scenarios)
+    for _d in (results_dir, baseline_dir):
+        for _f in _d.glob("*_baseline.csv"):
+            all_pdes.add(_f.stem[: -len("_baseline")])
 
     dfs = []
     for pde in cfg.pde_scenarios:
@@ -108,7 +190,7 @@ def load_all(cfg: Config, results_dir: pathlib.Path = None, baseline_dir: pathli
         else:
             print(f"  [warn] no baseline CSV for {pde} in {baseline_dir}")
 
-        # Load Phase 2 CSVs from results_dir (skip baseline)
+        # Load Phase 2 CSVs from results_dir (skip baseline — already loaded)
         for csv_path in sorted(results_dir.glob(f"{pde}_*.csv")):
             if any(csv_path.stem.startswith(p + "_") for p in longer_pdes):
                 continue
@@ -127,16 +209,13 @@ def load_all(cfg: Config, results_dir: pathlib.Path = None, baseline_dir: pathli
     return pd.concat(dfs, ignore_index=True)
 
 
-# ── Melting helpers ───────────────────────────────────────────────────────────
+# ── Melting helpers ──────────────────────────────────────────────────────────
 
 def _id_cols(data: pd.DataFrame) -> list:
-    """Return whichever identifying columns are present."""
-    candidates = ["seed", "pde", "condition"]
-    return [c for c in candidates if c in data.columns]
+    return [c for c in ("seed", "pde", "condition") if c in data.columns]
 
 
 def melt_nrmse(data: pd.DataFrame) -> pd.DataFrame:
-    """Wide → long for mean_nRMSE_XXXX columns."""
     stub = "mean_nRMSE_"
     value_cols = sorted(c for c in data.columns if c.startswith(stub))
     melted = data[_id_cols(data) + value_cols].melt(
@@ -150,7 +229,6 @@ def melt_nrmse(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def melt_loss(data: pd.DataFrame) -> pd.DataFrame:
-    """Wide → long for train_loss_XXXXXX columns."""
     stub = "train_loss_"
     value_cols = sorted(c for c in data.columns if c.startswith(stub))
     if not value_cols:
@@ -165,172 +243,283 @@ def melt_loss(data: pd.DataFrame) -> pd.DataFrame:
     return melted.drop(columns="_col")
 
 
-# ── Shared plot styling ───────────────────────────────────────────────────────
+# ── Shared styling ───────────────────────────────────────────────────────────
 
 def _apply_grid(ax):
-    ax.grid(True, alpha=0.25, linestyle="--")
+    ax.grid(True, alpha=0.25, linestyle="--", which="both")
     ax.spines[["top", "right"]].set_visible(False)
 
 
 def _pde_title(pde_key: str) -> str:
-    """'phy_burgers_sc' → 'Burgers Sc'"""
-    return pde_key.removeprefix("phy_").replace("_", " ").title()
+    """'phy_burgers_sc' → 'Burgers (single-channel)'; 'phy_ks' → 'Kuramoto-Sivashinsky'."""
+    nice = {
+        "phy_burgers_sc": "Burgers (single-channel)",
+        "phy_burgers":    "Burgers",
+        "phy_diff":       "Diffusion",
+        "phy_adv":        "Advection",
+        "phy_adv_diff":   "Advection-Diffusion",
+        "phy_ks":         "Kuramoto-Sivashinsky",
+        "phy_gs":         "Gray-Scott",
+        "phy_ks_cons":    "KS (conservative)",
+        "phy_kdv":        "KdV",
+        "phy_fisher":     "Fisher-KPP",
+        "phy_sh":         "Swift-Hohenberg",
+    }
+    return nice.get(pde_key, pde_key.removeprefix("phy_").replace("_", " ").title())
 
 
-def _make_fig(n_pdes: int, height: float = 4.0):
+def _grid_shape(n: int) -> Tuple[int, int]:
+    """Prefer 2×N/2 for n>=4 so subplots get real estate; single row for n<=3."""
+    if n <= 3:
+        return 1, n
+    if n <= 6:
+        return 2, math.ceil(n / 2)
+    return 3, math.ceil(n / 3)
+
+
+def _make_grid(n_pdes: int, subplot_size: Tuple[float, float] = (5.0, 3.8)):
+    rows, cols = _grid_shape(n_pdes)
+    w, h = subplot_size
     fig, axes = plt.subplots(
-        1, n_pdes, figsize=(5 * n_pdes, height), squeeze=False
+        rows, cols,
+        figsize=(w * cols, h * rows),
+        squeeze=False,
     )
-    return fig, axes[0]   # axes[0] is the 1-D array of axes
+    flat = axes.flatten()
+    # Hide any leftover axes when n_pdes isn't a perfect fit.
+    for ax in flat[n_pdes:]:
+        ax.set_visible(False)
+    return fig, flat[:n_pdes], rows, cols
 
 
-# ── Figure 1 — nRMSE rollout ──────────────────────────────────────────────────
+def _shared_legend(fig, handles, labels, rows: int, cols: int):
+    """Place one shared legend below the subplot grid."""
+    n_items = len(labels)
+    ncol = min(n_items, max(3, cols * 2))
+    fig.legend(
+        handles, labels,
+        loc="lower center",
+        ncol=ncol,
+        frameon=False,
+        bbox_to_anchor=(0.5, -0.02),
+        fontsize=9,
+    )
+
+
+def _ordered_handles(ax, all_conditions: List[str], palette: Dict[str, str]):
+    """Return legend handles/labels in canonical order (baseline first, etc.)."""
+    handles, labels = ax.get_legend_handles_labels()
+    # Canonical order across figures
+    ordered_conds = sorted(set(all_conditions), key=_sort_key)
+    label_to_cond = {condition_label(c): c for c in set(all_conditions)}
+    order = []
+    for c in ordered_conds:
+        lbl = condition_label(c)
+        if lbl in labels:
+            order.append(labels.index(lbl))
+    return [handles[i] for i in order], [labels[i] for i in order]
+
+
+# ── Figure 1 — nRMSE rollout (log y) ─────────────────────────────────────────
 
 def plot_nrmse_rollout(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path, suffix: str = ""):
-    """
-    One subplot per PDE.
-    x: test timestep   y: mean nRMSE
-    Two lines (baseline / conditioned) with 95% CI shading across seeds.
-    """
     df = melt_nrmse(data)
-    df["Condition"] = df["condition"].map(_condition_label)
-    conditions = df["condition"].unique()
-    palette = {_condition_label(c): _condition_color(c) for c in conditions}
+    all_conditions = list(df["condition"].unique())
+    palette_by_cond = build_palette(all_conditions)
+    palette_by_label = {condition_label(c): palette_by_cond[c] for c in all_conditions}
+    df["Condition"] = df["condition"].map(condition_label)
 
-    fig, axes = _make_fig(len(cfg.pde_scenarios))
+    fig, axes, rows, cols = _make_grid(len(cfg.pde_scenarios))
 
     for ax, pde in zip(axes, cfg.pde_scenarios):
+        sub = df[df["pde"] == pde]
+        if sub.empty:
+            ax.set_visible(False)
+            continue
         sns.lineplot(
-            data=df[df["pde"] == pde],
+            data=sub,
             x="time_step",
             y="mean_nRMSE",
             hue="Condition",
-            palette=palette,
+            hue_order=[condition_label(c) for c in sorted(all_conditions, key=_sort_key)],
+            palette=palette_by_label,
             errorbar=("ci", 95),
+            linewidth=1.4,
             ax=ax,
+            legend=False,
         )
-        ax.set_title(_pde_title(pde), fontsize=12, fontweight="bold")
+        ax.set_yscale("log")
+        ax.set_title(_pde_title(pde), fontsize=11, fontweight="bold")
         ax.set_xlabel("Test Timestep")
-        ax.set_ylabel("Mean nRMSE")
-        ax.legend(title="", fontsize=9)
+        ax.set_ylabel("Mean nRMSE (log)")
         _apply_grid(ax)
 
-    fig.suptitle(
-        "Rollout Error: Baseline vs Language-Conditioned FNO",
-        fontsize=13, y=1.02,
-    )
-    fig.tight_layout()
+    # Build legend once from a dummy invisible plot so every label is present
+    dummy_fig, dummy_ax = plt.subplots()
+    for cond in sorted(set(all_conditions), key=_sort_key):
+        dummy_ax.plot([], [], color=palette_by_cond[cond], linewidth=2, label=condition_label(cond))
+    handles, labels = dummy_ax.get_legend_handles_labels()
+    plt.close(dummy_fig)
+
+    _shared_legend(fig, handles, labels, rows, cols)
+    fig.suptitle("Rollout Error: Baseline vs Language-Conditioned FNO", fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.97))
     out = save_dir / f"nrmse_rollout{suffix}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out}")
 
 
-# ── Figure 2 — Training loss ──────────────────────────────────────────────────
+# ── Figure 2 — Training loss (log y) ─────────────────────────────────────────
 
 def plot_train_loss(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path, suffix: str = ""):
-    """
-    One subplot per PDE.
-    x: training step   y: MSE loss (log scale)
-    Two lines with 95% CI shading across seeds.
-    """
     df = melt_loss(data)
     if df.empty:
         print("  [warn] No loss columns found — skipping train_loss.png")
         return
 
-    df["Condition"] = df["condition"].map(_condition_label)
-    conditions = df["condition"].unique()
-    palette = {_condition_label(c): _condition_color(c) for c in conditions}
+    all_conditions = list(df["condition"].unique())
+    palette_by_cond = build_palette(all_conditions)
+    palette_by_label = {condition_label(c): palette_by_cond[c] for c in all_conditions}
+    df["Condition"] = df["condition"].map(condition_label)
 
-    fig, axes = _make_fig(len(cfg.pde_scenarios))
+    fig, axes, rows, cols = _make_grid(len(cfg.pde_scenarios))
 
     for ax, pde in zip(axes, cfg.pde_scenarios):
+        sub = df[df["pde"] == pde]
+        if sub.empty:
+            ax.set_visible(False)
+            continue
         sns.lineplot(
-            data=df[df["pde"] == pde],
+            data=sub,
             x="update_step",
             y="train_loss",
             hue="Condition",
-            palette=palette,
+            hue_order=[condition_label(c) for c in sorted(all_conditions, key=_sort_key)],
+            palette=palette_by_label,
             errorbar=("ci", 95),
+            linewidth=1.4,
             ax=ax,
+            legend=False,
         )
-        ax.set_title(_pde_title(pde), fontsize=12, fontweight="bold")
-        ax.set_xlabel("Training Step")
-        ax.set_ylabel("MSE Loss")
         ax.set_yscale("log")
-        ax.legend(title="", fontsize=9)
+        ax.set_title(_pde_title(pde), fontsize=11, fontweight="bold")
+        ax.set_xlabel("Training Step")
+        ax.set_ylabel("MSE Loss (log)")
         _apply_grid(ax)
 
-    fig.suptitle(
-        "Training Loss: Baseline vs Language-Conditioned FNO",
-        fontsize=13, y=1.02,
-    )
-    fig.tight_layout()
+        # Vertical markers where warmup ends and cosine decay begins.
+        # Warmup is inferred from max(update_step) in the data per group,
+        # matching the config formula max(min_warmup, total_steps // 6).
+        pde_conds = sub["condition"].unique()
+        seen_steps = set()
+        baseline_conds = [c for c in pde_conds if c == "baseline"]
+        frozen_conds   = [c for c in pde_conds if c != "baseline" and not c.endswith("_joint")]
+        joint_conds    = [c for c in pde_conds if c.endswith("_joint")]
+        for cond_group, min_warmup in [
+            (baseline_conds, 200),
+            (frozen_conds,   100),
+            (joint_conds,    100),
+        ]:
+            if not cond_group:
+                continue
+            valid = sub[sub["condition"].isin(cond_group) & sub["train_loss"].notna()]
+            if valid.empty:
+                continue
+            max_step = int(valid["update_step"].max())
+            warmup = max(min_warmup, max_step // 6)
+            if warmup not in seen_steps:
+                ax.axvline(x=warmup, color="black", linestyle=":", linewidth=1.0, alpha=0.45)
+                seen_steps.add(warmup)
+
+    dummy_fig, dummy_ax = plt.subplots()
+    for cond in sorted(set(all_conditions), key=_sort_key):
+        dummy_ax.plot([], [], color=palette_by_cond[cond], linewidth=2, label=condition_label(cond))
+    dummy_ax.axvline(x=0, color="black", linestyle=":", linewidth=1.0, alpha=0.45, label="Warmup end")
+    handles, labels = dummy_ax.get_legend_handles_labels()
+    plt.close(dummy_fig)
+
+    _shared_legend(fig, handles, labels, rows, cols)
+    fig.suptitle("Training Loss: Baseline vs Language-Conditioned FNO", fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.97))
     out = save_dir / f"train_loss{suffix}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out}")
 
 
-# ── Figure 3 — Final nRMSE bar chart ─────────────────────────────────────────
+# ── Figure 3 — Faceted final-nRMSE bars ──────────────────────────────────────
 
 def plot_final_nrmse_bar(data: pd.DataFrame, cfg: Config, save_dir: pathlib.Path, suffix: str = ""):
-    """
-    Grouped bar chart: PDE × condition at the final test timestep.
-    Error bars = std across seeds.
-    """
+    """One subplot per PDE so each gets its own y-scale — fixes the problem
+    where a PDE with much larger error (e.g. Diffusion) crushed every other
+    PDE's bars into invisibility."""
     df = melt_nrmse(data)
     final_t = df["time_step"].max()
     df = df[df["time_step"] == final_t].copy()
-    df["Condition"] = df["condition"].map(_condition_label)
-    df["PDE"] = df["pde"].map(_pde_title)
-    conditions = df["condition"].unique()
-    palette = {_condition_label(c): _condition_color(c) for c in conditions}
+    df["Condition"] = df["condition"].map(condition_label)
 
-    fig, ax = plt.subplots(figsize=(max(5, len(cfg.pde_scenarios) * 2.5), 4))
-    sns.barplot(
-        data=df,
-        x="PDE",
-        y="mean_nRMSE",
-        hue="Condition",
-        palette=palette,
-        errorbar="sd",
-        capsize=0.08,
-        ax=ax,
-    )
-    ax.set_title(
-        f"Final Mean nRMSE at Timestep {final_t}  (lower is better)",
-        fontsize=12, fontweight="bold",
-    )
-    ax.set_xlabel("")
-    ax.set_ylabel("Mean nRMSE")
-    ax.legend(title="", fontsize=9)
-    _apply_grid(ax)
+    all_conditions = list(df["condition"].unique())
+    palette_by_cond = build_palette(all_conditions)
+    palette_by_label = {condition_label(c): palette_by_cond[c] for c in all_conditions}
+    ordered_labels = [condition_label(c) for c in sorted(all_conditions, key=_sort_key)]
 
-    fig.tight_layout()
+    fig, axes, rows, cols = _make_grid(len(cfg.pde_scenarios), subplot_size=(6.0, 4.2))
+
+    for ax, pde in zip(axes, cfg.pde_scenarios):
+        sub = df[df["pde"] == pde]
+        if sub.empty:
+            ax.set_visible(False)
+            continue
+        sns.barplot(
+            data=sub,
+            x="Condition",
+            y="mean_nRMSE",
+            hue="Condition",
+            order=ordered_labels,
+            hue_order=ordered_labels,
+            palette=palette_by_label,
+            errorbar="sd",
+            capsize=0.15,
+            ax=ax,
+            legend=False,
+        )
+        ax.set_title(_pde_title(pde), fontsize=11, fontweight="bold")
+        ax.set_xlabel("")
+        ax.set_ylabel("Mean nRMSE")
+        # Per-subplot scale so each PDE is readable on its own terms.
+        # Rotate x labels so long condition names don't overlap.
+        ax.tick_params(axis="x", rotation=40)
+        for tick in ax.get_xticklabels():
+            tick.set_ha("right")
+            tick.set_fontsize(8)
+        _apply_grid(ax)
+
+    dummy_fig, dummy_ax = plt.subplots()
+    for cond in sorted(set(all_conditions), key=_sort_key):
+        dummy_ax.bar([0], [0], color=palette_by_cond[cond], label=condition_label(cond))
+    handles, labels = dummy_ax.get_legend_handles_labels()
+    plt.close(dummy_fig)
+
+    _shared_legend(fig, handles, labels, rows, cols)
+    fig.suptitle(
+        f"Final Mean nRMSE at Timestep {final_t}  (lower is better; error bars = std across seeds)",
+        fontsize=13, fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, 0.08, 1, 0.96))
     out = save_dir / f"final_nrmse_bar{suffix}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Plot training results")
-    parser.add_argument(
-        "--results-dir", default=None,
-        help="Override results directory (default: cfg.results_dir from config.py)",
-    )
-    parser.add_argument(
-        "--figures-dir", default=None,
-        help="Override figures output directory (default: cfg.figures_dir from config.py)",
-    )
-    parser.add_argument(
-        "--suffix", default="",
-        help="Suffix appended to output filenames, e.g. 'baseline' -> nrmse_rollout_baseline.png",
-    )
+    parser.add_argument("--results-dir", default=None)
+    parser.add_argument("--figures-dir", default=None)
+    parser.add_argument("--suffix", default="")
     args = parser.parse_args()
 
     cfg = Config()
@@ -345,7 +534,9 @@ def main():
     conditions = sorted(data["condition"].unique()) if "condition" in data.columns else []
     print(f"  PDEs: {data['pde'].nunique()}  "
           f"Seeds: {data['seed'].nunique()}  "
-          f"Conditions: {conditions}")
+          f"Conditions ({len(conditions)}):")
+    for c in sorted(conditions, key=_sort_key):
+        print(f"    - {c!r:60s} → {condition_label(c)}")
 
     print(f"\nGenerating figures -> {figures_dir}/")
     plot_nrmse_rollout(data, cfg, figures_dir, suffix)

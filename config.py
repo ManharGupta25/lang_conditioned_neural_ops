@@ -12,7 +12,11 @@ class Config:
         "phy_adv",          # 1D Advection (pure transport)
         "phy_adv_diff",     # 1d advection diffusion
         "phy_ks",           # 1D Kuramoto-Shivashinsky
-        "phy_burgers",      # 1D Burgers (multi-dimensional)
+        "phy_burgers",      # 1D Burgers
+        #"phy_ks_cons",      # 1D Burgers (multi-dimensional)
+        #"phy_kdv",      # 1D Burgers (multi-dimensional)
+        #"phy_fisher",      # 1D Burgers (multi-dimensional)
+        #"phy_sh",           # 1D Swift-Hohenberg (pattern formation)
         #"phy_gs"
     ])
 
@@ -40,9 +44,47 @@ class Config:
     #
     llm_model_name: str = "meta-llama/Llama-2-7b-hf"
 
+    # Controls how llm_model_name is loaded for embedding.
+    #   "automodel"             — HuggingFace AutoModel (default). embedding_layer_mode
+    #                             applies. Mean-pools encoder hidden states.
+    #   "sentence_transformers" — sentence-transformers library. Pooling applied
+    #                             automatically per model (mean/CLS/etc.).
+    #                             Requires: pip install sentence-transformers
+    #   "adapter"               — adapters library for adapter-based models (e.g.
+    #                             SPECTER2). llm_model_name is the adapter repo
+    #                             (e.g. "allenai/specter2"); the base model is
+    #                             inferred from _load_adapter_model's default.
+    #                             Uses CLS-token pooling. embedding_layer_mode ignored.
+    #                             Requires: pip install adapters
+    embedding_backend: str = "automodel"
+
     # z_embed_dim is set automatically from the loaded model; do not set manually.
     # It is written here as a placeholder that gets filled in train.py after loading.
     z_embed_dim: Optional[int] = None
+
+    # ── Prompt style (CoT ablation) ───────────────────────────────────────────
+    # Controls what text is embedded by the LLM to produce z.
+    #   "declarative"      — current PDE_DESCRIPTIONS, embedded at max_length=128
+    #   "declarative_long" — same text, embedded at cot_max_length (control for
+    #                        longer-sequence pooling without richer content)
+    #   "cot_generated"    — TinyLlama.generate() produces a 5-step reasoning
+    #                        trace; cached to disk and embedded at cot_max_length
+    prompt_style: str = "cot_generated"
+
+    # ── Embedding layer strategy ──────────────────────────────────────────────
+    # Controls which transformer hidden states are used to form z.
+    #   "last"       — use only the final transformer layer's hidden states
+    #                  (current default; biased toward next-token prediction)
+    #   "all_layers" — mean over all transformer block outputs (layers 1..N,
+    #                  skipping the raw embedding at index 0), then token-pool.
+    #                  Dilutes the prediction bias of the final layer and pulls
+    #                  in richer semantic representations from middle layers.
+    embedding_layer_mode: str = "last"
+    cot_max_length: int = 512
+    cot_gen_max_new_tokens: int = 400
+    cot_gen_temperature: float = 0.0
+    cot_gen_seed: int = 0
+    cot_cache_dir: str = "cache/cot_generated"
 
     # ── FNO architecture ──────────────────────────────────────────────────────
     # Shared between baseline FNO and conditioned FNO.
@@ -59,7 +101,7 @@ class Config:
     # Primary ablation axis: which method to use for injecting z into the FNO.
     #   "film"            — FiLM: (1 + gamma) * x + beta  per channel
     #   "spectral_gating" — per-frequency gate in Fourier space
-    conditioning_method: str = "film"
+    conditioning_method: str = "spectral_gating"
 
     # Spectral gating MLP hyperparameters (only used when conditioning_method="spectral_gating")
     sg_mlp_width: int = 64    # hidden layer width (default: same as z_cond_dim)
@@ -73,7 +115,7 @@ class Config:
 
     # ── Training (Phase 2) ────────────────────────────────────────────────────
     # Steps when FNO trunk is frozen — only conditioning layers train.
-    phase2_train_steps: int = 20000
+    phase2_train_steps: int = 30000
 
     # Steps for joint fine-tuning (freeze_fno_trunk=False). Fewer than
     # phase2_train_steps to reduce risk of trunk drifting from Phase 1 solution.
@@ -95,9 +137,9 @@ class Config:
     num_seeds: int = 5
 
     # ── Output ────────────────────────────────────────────────────────────────
-    results_dir: str = "results/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"       # CSVs saved here for plotting
-    figures_dir: str = "figures/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"       # figures saved here by plot.py
-    checkpoints_dir: str = "checkpoints/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/train_20000_10000"  # model checkpoints
+    results_dir: str = "results/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/specter2/train_30000_10000"       # CSVs saved here for plotting
+    figures_dir: str = "figures/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/specter2/train_30000_10000"       # figures saved here by plot.py
+    checkpoints_dir: str = "checkpoints/fno_12_64_6_gelu_train_30000_1000_50_50_test_100/phase2/specter2/train_30000_10000"  # model checkpoints
     embeddings_dir: str = "embeddings"   # precomputed LLM embeddings (optional, for CUDA conflict workaround)
 
     # If set, Phase 2 loads Phase 1 baseline checkpoints from this directory
@@ -124,12 +166,16 @@ class Config:
 
     def phase2_label(self) -> str:
         """Label used for Phase 2 checkpoint and CSV filenames.
-        Encodes conditioning method, LLM, and freeze state.
+        Encodes conditioning method, LLM, prompt style, and freeze state.
         e.g. 'film_distilbert', 'spectral_gating_tinyllama',
-             'film_tinyllama_joint' (when freeze_fno_trunk=False)
+             'film_tinyllama_joint' (when freeze_fno_trunk=False),
+             'spectral_gating_tinyllama_cot_generated',
+             'film_tinyllama_declarative_long_joint'
+        The declarative style adds no tag so existing runs keep their labels.
         """
         suffix = "_joint" if not self.freeze_fno_trunk else ""
-        return f"{self.conditioning_method}_{self.llm_short_name()}{suffix}"
+        style_tag = "" if self.prompt_style == "declarative" else f"_{self.prompt_style}"
+        return f"{self.conditioning_method}_{self.llm_short_name()}{style_tag}{suffix}"
 
     def fno_network_config(self) -> str:
         """Network config string for the plain baseline FNO."""
